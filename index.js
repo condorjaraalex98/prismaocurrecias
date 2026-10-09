@@ -58,7 +58,38 @@ const r2Client = new S3Client({
 
 const BUCKET_NAME = process.env.R2_BUCKET_NAME;
 const PUBLIC_DOMAIN = process.env.R2_PUBLIC_DOMAIN;
-
+// Función limpiadora (ponla arriba, junto a tus funciones o middlewares)
+function limpiarUrlR2(input) {
+  if (!input) return null;
+  let texto = typeof input === "string" ? input : JSON.stringify(input);
+  
+  // 1. Si viene con formato Markdown [link](link), extraemos el enlace de los paréntesis
+  const matchMarkdown = texto.match(/\((https?:\/\/[^\s\)]+)\)/);
+  if (matchMarkdown && matchMarkdown[1]) {
+    texto = matchMarkdown[1];
+  } else {
+    // 2. Si no, limpiamos corchetes, comillas y espacios
+    texto = texto.replace(/[\[\]'"]+/g, "").trim();
+  }
+  
+  // 3. Extraemos la primera URL válida que comience con http o https
+  const matchHttp = texto.match(/(https?:\/\/[^\s\)]+)/);
+  if (!matchHttp) return null;
+  
+  let urlPura = matchHttp[1];
+  
+  // 4. Protección contra dominios duplicados (ej: r2.dev...r2.dev)
+  const domain = "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
+  const firstIdx = urlPura.indexOf(domain);
+  if (firstIdx !== -1) {
+    const secondIdx = urlPura.indexOf(domain, firstIdx + domain.length);
+    if (secondIdx !== -1) {
+      urlPura = urlPura.slice(0, secondIdx);
+    }
+  }
+  
+  return urlPura;
+}
 // ==========================================
 // 📸 ENDPOINT NUEVO: SUBIR FOTO ADJUNTA INDIVIDUAL
 // ==========================================
@@ -118,9 +149,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
   console.log(`==================================================`);
 
   if (!fotos || !Array.isArray(fotos) || fotos.length === 0) {
-    console.warn(
-      `⚠️ No se recibieron fotos en el array para la ocurrencia #${id_ocurrencia}`,
-    );
+    console.warn(`⚠️ No se recibieron fotos en el array para la ocurrencia #${id_ocurrencia}`);
     return;
   }
 
@@ -130,7 +159,6 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
 
       let bufferOriginal = null;
 
-      // CASO 1: Viene un archivo real adjunto (desde la web con FormData o buffer directo)
       if (f && f.archivo_real) {
         console.log(`📦 Detectado archivo real físico en foto [${idx}]`);
         if (typeof f.archivo_real.arrayBuffer === "function") {
@@ -139,9 +167,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
         } else if (Buffer.isBuffer(f.archivo_real)) {
           bufferOriginal = f.archivo_real;
         }
-      }
-      // CASO 2: Viene como un string o un objeto con propiedades de texto (Base64 o URL)
-      else {
+      } else {
         let base64Data = null;
         if (typeof f === "string") {
           base64Data = f;
@@ -154,24 +180,25 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
         }
 
         if (!base64Data) {
-          console.error(
-            `❌ La foto [${idx}] no contiene una estructura válida.`,
-            JSON.stringify(f),
-          );
+          console.error(`❌ La foto [${idx}] no contiene una estructura válida.`, JSON.stringify(f));
           continue;
         }
 
-        // Si es una URL http existente que ya está en la nube (ej. subida con /subir-foto-adjunta), la registra directo en BD
-        if (base64Data.startsWith("http")) {
-          console.log(
-            `🌐 La foto [${idx}] ya es una URL web existente, registrando en BD...`,
-          );
-          const publicIdExistente = base64Data.includes(PUBLIC_DOMAIN)
-            ? base64Data.replace(`${PUBLIC_DOMAIN}/`, "")
+        // 🛡️ APLICAMOS LA LIMPIEZA ESTRICTA AQUÍ
+        const urlLimpia = limpiarUrlR2(base64Data);
+
+        // Si ya es una URL web existente limpia, la registramos directo en BD sin re-subir
+        if (base64Data.startsWith("http") || (urlLimpia && base64Data.includes("r2.dev"))) {
+          const urlFinalRegistro = urlLimpia || base64Data;
+          console.log(`🌐 La foto [${idx}] ya es una URL web, registrando en BD limpia: ${urlFinalRegistro}`);
+          
+          const publicIdExistente = urlFinalRegistro.includes(PUBLIC_DOMAIN)
+            ? urlFinalRegistro.replace(`${PUBLIC_DOMAIN}/`, "")
             : null;
+
           await dbPool.query(
             "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
-            [id_ocurrencia, base64Data, publicIdExistente],
+            [id_ocurrencia, urlFinalRegistro, publicIdExistente],
           );
           continue;
         }
@@ -189,7 +216,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
       // 3. OPTIMIZAR CON SHARP Y AUTOROTACIÓN
       console.log(`⚙️ Comprimiendo foto [${idx}] con Sharp...`);
       const bufferOptimizado = await sharp(bufferOriginal)
-        .rotate() // Corrige rotación vertical/horizontal de smartphone
+        .rotate()
         .resize({ width: 1200, withoutEnlargement: true })
         .jpeg({ quality: 75 })
         .toBuffer();
@@ -203,9 +230,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
       const nombreArchivo = `ocurrencias/${anio}/${mes}/${id_ocurrencia}_${idx}_${timestamp}_${randomId}.jpg`;
 
       // 4. SUBIR A CLOUDFLARE R2
-      console.log(
-        `🚀 Subiendo foto [${idx}] a Cloudflare R2 (${nombreArchivo})...`,
-      );
+      console.log(`🚀 Subiendo foto [${idx}] a Cloudflare R2 (${nombreArchivo})...`);
       await r2Client.send(
         new PutObjectCommand({
           Bucket: BUCKET_NAME,
@@ -218,7 +243,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
       const urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
       console.log(`🌐 URL Generada: ${urlImagen}`);
 
-      // 5. GUARDAR URL Y EL PUBLIC_ID EN MYSQL
+      // 5. GUARDAR URL LIMPIA EN MYSQL
       console.log(`💾 Guardando URL y public_id en base de datos MySQL...`);
       await dbPool.query(
         "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
