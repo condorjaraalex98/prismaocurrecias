@@ -78,7 +78,18 @@ function limpiarUrlR2(input) {
   
   let urlPura = matchHttp[1];
   
-  // 4. Protección contra dominios duplicados (ej: r2.dev...r2.dev)
+  // 4. CORTE RADICAL: Si por alguna razón quedó un paréntesis '(' o un segundo 'https' pegado, cortamos ahí mismo
+  const parentesisIndex = urlPura.indexOf("(");
+  if (parentesisIndex !== -1) {
+    urlPura = urlPura.slice(0, parentesisIndex);
+  }
+  
+  const segundoHttpIndex = urlPura.indexOf("https://", 8);
+  if (segundoHttpIndex !== -1) {
+    urlPura = urlPura.slice(0, segundoHttpIndex);
+  }
+
+  // 5. Protección contra dominios duplicados (ej: r2.dev...r2.dev)
   const domain = "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
   const firstIdx = urlPura.indexOf(domain);
   if (firstIdx !== -1) {
@@ -88,7 +99,7 @@ function limpiarUrlR2(input) {
     }
   }
   
-  return urlPura;
+  return urlPura.trim();
 }
 // ==========================================
 // 📸 ENDPOINT NUEVO: SUBIR FOTO ADJUNTA INDIVIDUAL
