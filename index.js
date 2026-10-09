@@ -7198,33 +7198,60 @@ LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
     const [rows] = await connection.query(sql, queryParams);
 
     // 5. Mapeo seguro de arrays JSON
-    const datosMapeados = rows.map((item) => {
-      let listaFotos = [];
-      let listaCamaras = [];
-      let listaVehiculos = [];
+    // 5. Mapeo seguro de arrays JSON blindado
+      const datosMapeados = rows.map((item) => {
+        let listaFotos = [];
+        let listaCamaras = [];
+        let listaVehiculos = [];
 
-      try { listaFotos = item.fotos_json ? JSON.parse(item.fotos_json) : []; } catch (e) {}
-      try { listaCamaras = item.camaras_json ? JSON.parse(item.camaras_json) : []; } catch (e) {}
-      try { listaVehiculos = item.vehiculos_json ? JSON.parse(item.vehiculos_json) : []; } catch (e) {}
+        // Parseo seguro para fotos (maneja tanto string JSON como arrays directos de MySQL)
+        try {
+          if (item.fotos_json) {
+            if (Array.isArray(item.fotos_json)) {
+              listaFotos = item.fotos_json;
+            } else if (typeof item.fotos_json === "string") {
+              listaFotos = JSON.parse(item.fotos_json);
+            }
+          }
+        } catch (e) {
+          listaFotos = [];
+        }
 
-      return {
-        ...item,
-        fecha_evento: item.fecha_evento || "S/F",
-        fecha_reporte: item.fecha_reporte || "S/F",
-        
-        // Mantenemos retrocompatibilidad con campos de UI
-        placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin dato",
-        vehiculos: listaVehiculos,
-        camaras: listaCamaras,
-        
-        // Fotos
-        total_fotos: listaFotos.length,
-        tiene_fotos: listaFotos.length > 0,
-        foto_principal: listaFotos[0] || null,
-        fotos: listaFotos,
-        lista_fotos: listaFotos
-      };
-    });
+        try {
+          if (item.camaras_json) {
+            listaCamaras = Array.isArray(item.camaras_json) ? item.camaras_json : JSON.parse(item.camaras_json);
+          }
+        } catch (e) {
+          listaCamaras = [];
+        }
+
+        try {
+          if (item.vehiculos_json) {
+            listaVehiculos = Array.isArray(item.vehiculos_json) ? item.vehiculos_json : JSON.parse(item.vehiculos_json);
+          }
+        } catch (e) {
+          listaVehiculos = [];
+        }
+
+        // Filtramos valores nulos o vacíos del array de fotos
+        listaFotos = listaFotos.filter((f) => f && f !== "null" && f !== "");
+
+        return {
+          ...item,
+          fecha_evento: item.fecha_evento || "S/F",
+          fecha_reporte: item.fecha_reporte || "S/F",
+          
+          placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin dato",
+          vehiculos: listaVehiculos,
+          camaras: listaCamaras,
+          
+          total_fotos: listaFotos.length,
+          tiene_fotos: listaFotos.length > 0,
+          foto_principal: listaFotos[0] || null,
+          fotos: listaFotos,
+          lista_fotos: listaFotos
+        };
+      });
 
     res.json({
       success: true,
