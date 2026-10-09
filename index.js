@@ -10804,20 +10804,21 @@ app.post("/api/vehiculo/iniciar-servicio", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-
+const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
+  
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
         descripcion, hora_alerta, hora_llegada, hora_repliegue, 
         id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
         id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
         nombre_punto_gps, referencia, unidad_encargada, 
         fecha_reporte, fecha_evento, estado, grupo, turno
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?)`;
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
       descripcion, hora_alerta || null, hora_llegada || null, hora_repliegue || null,
       id_lugar, id_usuario, id_modalidad, id_modalidad, id_origen,
       id_tipop || null, id_modalidadp || null, latitud_gps || 0, longitud_gps || 0,
-      nombre_punto_gps || "", referencia || "", unidad_encargada || "SERENAZGO",
+      nombre_punto_gps || "", referencia || "", unidad_encargada || "SERENAZGO",fechaReportePeru,
       fecha_evento, estadoOcurrencia, grupo, turno || null,
     ]);
 
@@ -10961,21 +10962,22 @@ app.post("/api/vehiculo/finalizar-servicio", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-
+const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
+  
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
         descripcion, hora_alerta, hora_llegada, hora_repliegue, 
         id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
         id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
         nombre_punto_gps, referencia, unidad_encargada, 
         fecha_reporte, fecha_evento, estado, grupo, turno
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?)`;
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
       descripcion || "Fin de Servicio", hora_alerta || null, hora_alerta || null, hora_alerta || null,
       id_lugar, id_usuario, id_modalidad, id_modalidad, id_origen || 9,
       id_tipop || null, id_modalidadp || null, latitud_gps || 0, longitud_gps || 0,
       nombre_punto_gps || "", referencia || "", unidad_encargada || "SERENAZGO",
-      fecha_evento, estadoOcurrencia, grupo, turno || null,
+      fecha_evento,fechaReportePeru, estadoOcurrencia, grupo, turno || null,
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
