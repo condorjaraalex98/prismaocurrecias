@@ -8,7 +8,8 @@ const cloudinary = require("cloudinary").v2; // Línea 4
 const sharp = require("sharp");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
-
+// Obtiene la fecha y hora actual exacta en Perú (Lima) formateada para MySQL
+const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
 // ⚡ Límite de concurrencia de Sharp para liberar Event Loop de Node.js en cargas masivas
 sharp.concurrency(1);
 
@@ -487,7 +488,7 @@ app.post("/ocurrencias/registrar/modr2", async (req, res) => {
             id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
             nombre_punto_gps, referencia, unidad_encargada, 
             fecha_reporte, fecha_evento, estado, grupo, turno
-        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?)`;
+        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
       descripcion,                     // 1
@@ -506,7 +507,8 @@ app.post("/ocurrencias/registrar/modr2", async (req, res) => {
       longitud_gps || 0,               // 14
       nombre_punto_gps || "",          // 15
       referencia || "",                // 16
-      unidad_encargada || "SERENAZGO", // 17
+      unidad_encargada || "SERENAZGO",
+      fechaReportePeru,// 17
       fecha_evento,                    // 18
       estadoOcurrencia,                // 19
       grupo,                           // 20
