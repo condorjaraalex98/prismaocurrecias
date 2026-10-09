@@ -62,34 +62,28 @@ const PUBLIC_DOMAIN = process.env.R2_PUBLIC_DOMAIN;
 function limpiarUrlR2(input) {
   if (!input) return null;
   let texto = typeof input === "string" ? input : JSON.stringify(input);
-  
-  // 1. Si viene con formato Markdown [link](link), extraemos el enlace de los paréntesis
-  const matchMarkdown = texto.match(/\((https?:\/\/[^\s\)]+)\)/);
-  if (matchMarkdown && matchMarkdown[1]) {
-    texto = matchMarkdown[1];
+
+  // 1. Extraer si viene en formato Markdown [texto](url) o con paréntesis
+  const matchMarkdown = texto.match(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/);
+  if (matchMarkdown && matchMarkdown[2]) {
+    texto = matchMarkdown[2];
   } else {
-    // 2. Si no, limpiamos corchetes, comillas y espacios
-    texto = texto.replace(/[\[\]'"]+/g, "").trim();
-  }
-  
-  // 3. Extraemos la primera URL válida que comience con http o https
-  const matchHttp = texto.match(/(https?:\/\/[^\s\)]+)/);
-  if (!matchHttp) return null;
-  
-  let urlPura = matchHttp[1];
-  
-  // 4. CORTE RADICAL: Si por alguna razón quedó un paréntesis '(' o un segundo 'https' pegado, cortamos ahí mismo
-  const parentesisIndex = urlPura.indexOf("(");
-  if (parentesisIndex !== -1) {
-    urlPura = urlPura.slice(0, parentesisIndex);
-  }
-  
-  const segundoHttpIndex = urlPura.indexOf("https://", 8);
-  if (segundoHttpIndex !== -1) {
-    urlPura = urlPura.slice(0, segundoHttpIndex);
+    const matchParentesis = texto.match(/\((https?:\/\/[^\s\)]+)\)/);
+    if (matchParentesis && matchParentesis[1]) {
+      texto = matchParentesis[1];
+    }
   }
 
-  // 5. Protección contra dominios duplicados (ej: r2.dev...r2.dev)
+  // 2. Limpiar corchetes, comillas y espacios sobrantes
+  texto = texto.replace(/[\[\]'"]+/g, "").trim();
+
+  // 3. Extraer estrictamente la primera URL válida que comience con http o https
+  const matchHttp = texto.match(/(https?:\/\/[^\s\)]+)/);
+  if (!matchHttp) return null;
+
+  let urlPura = matchHttp[1];
+
+  // 4. Cortar si hay duplicaciones del dominio de Cloudflare
   const domain = "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
   const firstIdx = urlPura.indexOf(domain);
   if (firstIdx !== -1) {
@@ -98,8 +92,10 @@ function limpiarUrlR2(input) {
       urlPura = urlPura.slice(0, secondIdx);
     }
   }
-  
-  return urlPura.trim();
+
+  // 5. Asegurar limpieza de cualquier carácter extraño al final
+  const finLimpio = urlPura.match(/[^\s\)]+/);
+  return finLimpio ? finLimpio[0] : urlPura;
 }
 // ==========================================
 // 📸 ENDPOINT NUEVO: SUBIR FOTO ADJUNTA INDIVIDUAL
@@ -199,20 +195,21 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
         const urlLimpia = limpiarUrlR2(base64Data);
 
         // Si ya es una URL web existente limpia, la registramos directo en BD sin re-subir
-        if (base64Data.startsWith("http") || (urlLimpia && base64Data.includes("r2.dev"))) {
-          const urlFinalRegistro = urlLimpia || base64Data;
-          console.log(`🌐 La foto [${idx}] ya es una URL web, registrando en BD limpia: ${urlFinalRegistro}`);
-          
-          const publicIdExistente = urlFinalRegistro.includes(PUBLIC_DOMAIN)
-            ? urlFinalRegistro.replace(`${PUBLIC_DOMAIN}/`, "")
-            : null;
+       // Si es una URL web existente, la limpiamos y registramos directo en BD
+if (base64Data.includes("r2.dev") || base64Data.startsWith("http")) {
+  const urlLimpiaParaBD = limpiarUrlR2(base64Data);
+  console.log(`🌐 URL limpia asegurada para BD: ${urlLimpiaParaBD}`);
 
-          await dbPool.query(
-            "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
-            [id_ocurrencia, urlFinalRegistro, publicIdExistente],
-          );
-          continue;
-        }
+  const publicIdExistente = urlLimpiaParaBD.includes(PUBLIC_DOMAIN)
+    ? urlLimpiaParaBD.replace(`${PUBLIC_DOMAIN}/`, "")
+    : null;
+
+  await dbPool.query(
+    "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
+    [id_ocurrencia, urlLimpiaParaBD, publicIdExistente],
+  );
+  continue;
+}
 
         // Limpiar y convertir Base64 a Buffer
         const base64Clean = base64Data.replace(/^data:image\/\w+;base64,/, "");
@@ -5975,15 +5972,16 @@ app.put("/ocurrencias/editar/:id_ocurrencia", async (req, res) => {
       const valoresFotos = [];
 
       for (let [idx, foto] of lista_fotos.entries()) {
-        let urlImagen =
-          typeof foto === "string" ? foto : foto.url_imagen || foto.url;
+        let rawUrl = typeof foto === "string" ? foto : foto.url_imagen || foto.url;
         let publicId = foto.public_id || null;
 
+        // 🛡️ APLICAMOS LA LIMPIEZA ESTRICTA CON TU FUNCIÓN
+        let urlImagen = limpiarUrlR2(rawUrl);
+
         // SI LA FOTO ES NUEVA (Viene en formato Base64 desde el FileReader web o móvil)
-        if (urlImagen && urlImagen.startsWith("data:image")) {
+        if (rawUrl && rawUrl.startsWith("data:image")) {
           try {
-            // Remueve cualquier encabezado data URI independientemente del formato (png, jpg, webp, etc.)
-const base64Clean = urlImagen.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
+            const base64Clean = rawUrl.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
             const bufferOriginal = Buffer.from(base64Clean, "base64");
 
             // Optimizar con Sharp
@@ -6018,13 +6016,15 @@ const base64Clean = urlImagen.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
             continue;
           }
         } else {
-          // SI LA FOTO YA EXISTE (Mantiene su URL pública de R2)
+          // SI LA FOTO YA EXISTE (Mantiene su URL pública limpia de R2)
           if (!publicId && urlImagen && urlImagen.includes(PUBLIC_DOMAIN)) {
             publicId = urlImagen.replace(`${PUBLIC_DOMAIN}/`, "");
           }
         }
 
-        valoresFotos.push([id_ocurrencia, urlImagen, publicId]);
+        if (urlImagen) {
+          valoresFotos.push([id_ocurrencia, urlImagen, publicId]);
+        }
       }
 
       // 4. Insertar las fotos actualizadas de golpe en MySQL
