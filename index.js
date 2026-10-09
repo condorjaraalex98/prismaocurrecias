@@ -5972,16 +5972,15 @@ app.put("/ocurrencias/editar/:id_ocurrencia", async (req, res) => {
       const valoresFotos = [];
 
       for (let [idx, foto] of lista_fotos.entries()) {
-        let rawUrl = typeof foto === "string" ? foto : foto.url_imagen || foto.url;
+        let urlImagen =
+          typeof foto === "string" ? foto : foto.url_imagen || foto.url;
         let publicId = foto.public_id || null;
 
-        // 🛡️ APLICAMOS LA LIMPIEZA ESTRICTA CON TU FUNCIÓN
-        let urlImagen = limpiarUrlR2(rawUrl);
-
         // SI LA FOTO ES NUEVA (Viene en formato Base64 desde el FileReader web o móvil)
-        if (rawUrl && rawUrl.startsWith("data:image")) {
+        if (urlImagen && urlImagen.startsWith("data:image")) {
           try {
-            const base64Clean = rawUrl.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
+            // Remueve cualquier encabezado data URI independientemente del formato (png, jpg, webp, etc.)
+const base64Clean = urlImagen.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
             const bufferOriginal = Buffer.from(base64Clean, "base64");
 
             // Optimizar con Sharp
@@ -6016,15 +6015,13 @@ app.put("/ocurrencias/editar/:id_ocurrencia", async (req, res) => {
             continue;
           }
         } else {
-          // SI LA FOTO YA EXISTE (Mantiene su URL pública limpia de R2)
+          // SI LA FOTO YA EXISTE (Mantiene su URL pública de R2)
           if (!publicId && urlImagen && urlImagen.includes(PUBLIC_DOMAIN)) {
             publicId = urlImagen.replace(`${PUBLIC_DOMAIN}/`, "");
           }
         }
 
-        if (urlImagen) {
-          valoresFotos.push([id_ocurrencia, urlImagen, publicId]);
-        }
+        valoresFotos.push([id_ocurrencia, urlImagen, publicId]);
       }
 
       // 4. Insertar las fotos actualizadas de golpe en MySQL
