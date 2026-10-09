@@ -479,8 +479,7 @@ app.post("/ocurrencias/registrar/modr2", async (req, res) => {
     connection = await db.getConnection();
     await connection.beginTransaction();
 const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
-    // 1. INSERTAR OCURRENCIA PRINCIPAL
-   // 1. INSERTAR OCURRENCIA PRINCIPAL
+  
    // 1. INSERTAR OCURRENCIA PRINCIPAL
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
             descripcion, hora_alerta, hora_llegada, hora_repliegue, 
@@ -9682,7 +9681,8 @@ app.post("/api/vehiculo/iniciar-servicio-checkcompleto", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-
+const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
+  
     // ==========================================
     // 1. INSERTAR OCURRENCIA PRINCIPAL
     // ==========================================
@@ -9692,7 +9692,7 @@ app.post("/api/vehiculo/iniciar-servicio-checkcompleto", async (req, res) => {
             id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
             nombre_punto_gps, referencia, unidad_encargada, 
             fecha_reporte, fecha_evento, estado, grupo
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, 'PENDIENTE', ?)`;
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
       descripcion,
@@ -9710,6 +9710,7 @@ app.post("/api/vehiculo/iniciar-servicio-checkcompleto", async (req, res) => {
       nombre_punto_gps || "",
       referencia || "",
       unidad_encargada || "SERENAZGO",
+      fechaReportePeru,// 17
       fecha_evento,
       grupo,
     ]);
