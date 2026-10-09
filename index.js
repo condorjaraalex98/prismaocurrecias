@@ -9,7 +9,7 @@ const sharp = require("sharp");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 // Obtiene la fecha y hora actual exacta en Perú (Lima) formateada para MySQL
-const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
+
 // ⚡ Límite de concurrencia de Sharp para liberar Event Loop de Node.js en cargas masivas
 sharp.concurrency(1);
 
@@ -478,7 +478,7 @@ app.post("/ocurrencias/registrar/modr2", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-
+const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
     // 1. INSERTAR OCURRENCIA PRINCIPAL
    // 1. INSERTAR OCURRENCIA PRINCIPAL
    // 1. INSERTAR OCURRENCIA PRINCIPAL
