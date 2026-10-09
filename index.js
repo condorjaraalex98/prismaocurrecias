@@ -7198,49 +7198,33 @@ LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
     const [rows] = await connection.query(sql, queryParams);
 
     // 5. Mapeo seguro de arrays JSON
-   // 5. Mapeo seguro y blindado de arrays JSON (Evita que lleguen vacíos)
-const datosMapeados = rows.map((item) => {
-  let listaFotos = [];
-  let listaCamaras = [];
-  let listaVehiculos = [];
+    const datosMapeados = rows.map((item) => {
+      let listaFotos = [];
+      let listaCamaras = [];
+      let listaVehiculos = [];
 
-  // Función auxiliar para parsear de forma segura sin importar si es string o array
-  const parseJsonField = (field) => {
-    if (!field) return [];
-    if (Array.isArray(field)) return field;
-    if (typeof field === "string") {
-      try {
-        const parsed = JSON.parse(field);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch (e) {
-        return [];
-      }
-    }
-    return [];
-  };
+      try { listaFotos = item.fotos_json ? JSON.parse(item.fotos_json) : []; } catch (e) {}
+      try { listaCamaras = item.camaras_json ? JSON.parse(item.camaras_json) : []; } catch (e) {}
+      try { listaVehiculos = item.vehiculos_json ? JSON.parse(item.vehiculos_json) : []; } catch (e) {}
 
-  listaFotos = parseJsonField(item.fotos_json);
-  listaCamaras = parseJsonField(item.camaras_json);
-  listaVehiculos = parseJsonField(item.vehiculos_json);
-
-  return {
-    ...item,
-    fecha_evento: item.fecha_evento || "S/F",
-    fecha_reporte: item.fecha_reporte || "S/F",
-    
-    // Asignaciones limpias y estructuradas
-    placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin dato",
-    vehiculos: listaVehiculos,
-    camaras: listaCamaras,
-    
-    // Fotos normalizadas para que el frontend las lea sin problemas
-    total_fotos: listaFotos.length,
-    tiene_fotos: listaFotos.length > 0,
-    foto_principal: listaFotos[0] || null,
-    fotos: listaFotos,
-    lista_fotos: listaFotos
-  };
-});
+      return {
+        ...item,
+        fecha_evento: item.fecha_evento || "S/F",
+        fecha_reporte: item.fecha_reporte || "S/F",
+        
+        // Mantenemos retrocompatibilidad con campos de UI
+        placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin dato",
+        vehiculos: listaVehiculos,
+        camaras: listaCamaras,
+        
+        // Fotos
+        total_fotos: listaFotos.length,
+        tiene_fotos: listaFotos.length > 0,
+        foto_principal: listaFotos[0] || null,
+        fotos: listaFotos,
+        lista_fotos: listaFotos
+      };
+    });
 
     res.json({
       success: true,
