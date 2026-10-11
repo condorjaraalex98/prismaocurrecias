@@ -477,7 +477,7 @@ app.post("/ocurrencias/registrar/modr2x", async (req, res) => {
 // INICIO DEL SERVIDOR
 // ==========================================
 
-app.post("/ocurrencias/registrar/modr2", async (req, res) => {
+app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
   let connection;
   try {
     const {
@@ -686,9 +686,11 @@ const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America
   }
 });
 
+// ==========================================
+// INICIO DEL SERVIDOR
+// ==========================================
 
-// Funcion bd)
-app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
+app.post("/ocurrencias/registrar/modr2", async (req, res) => {
   let connection;
   try {
     const {
@@ -710,6 +712,7 @@ app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
       unidad_encargada,
       fecha_evento,
       grupo,
+      turno,
       fotos,
       estadoOcurrencia,
       vehiculos_detalle,
@@ -721,35 +724,57 @@ app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
+    const opciones = { 
+  timeZone: "America/Lima", 
+  year: 'numeric', 
+  month: '2-digit', 
+  day: '2-digit', 
+  hour: '2-digit', 
+  minute: '2-digit', 
+  second: '2-digit', 
+  hour12: false 
+};
+const partesFecha = new Intl.DateTimeFormat('sv-SE', opciones).formatToParts(new Date());
 
-    // 1. INSERTAR OCURRENCIA PRINCIPAL
+const anio = partesFecha.find(p => p.type === 'year').value;
+const mes = partesFecha.find(p => p.type === 'month').value;
+const dia = partesFecha.find(p => p.type === 'day').value;
+const hora = partesFecha.find(p => p.type === 'hour').value;
+const minuto = partesFecha.find(p => p.type === 'minute').value;
+const segundo = partesFecha.find(p => p.type === 'second').value;
+const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
+   // 1. INSERTAR OCURRENCIA PRINCIPAL
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
             descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-            id_lugar, id_usuario, id_modalidad, id_origen,
-            id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
+            id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
+            id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
             nombre_punto_gps, referencia, unidad_encargada, 
-            fecha_reporte, fecha_evento, estado, grupo
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)`;
+            fecha_reporte, fecha_evento, estado, grupo, turno
+        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion,
-      hora_alerta || null,
-      hora_llegada || null,
-      hora_repliegue || null,
-      id_lugar,
-      id_usuario,
-      id_modalidad,
-      id_origen,
-      id_tipop || null,
-      id_modalidadp || null,
-      latitud_gps || 0,
-      longitud_gps || 0,
-      nombre_punto_gps || "",
-      referencia || "",
+      descripcion,                     // 1
+      hora_alerta || null,             // 2
+      hora_llegada || null,            // 3
+      hora_repliegue || null,          // 4
+      id_lugar,                        // 5
+      id_usuario,                      // 6
+      id_modalidad,                    // 7 (id_modalidad principal)
+      id_modalidad,                    // 8 (id_modalidad_inicial)
+   
+      id_origen,                       // 10
+      id_tipop || null,                // 11
+      id_modalidadp || null,           // 12
+      latitud_gps || 0,                // 13
+      longitud_gps || 0,               // 14
+      nombre_punto_gps || "",          // 15
+      referencia || "",                // 16
       unidad_encargada || "SERENAZGO",
-      fecha_evento,
-      estadoOcurrencia, // <-- Pasamos la variable dinámica aquí
-      grupo,
+      fechaReportePeru,// 17
+      fecha_evento,                    // 18
+      estadoOcurrencia,                // 19
+      grupo,                           // 20
+      turno || null                    // 21
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
@@ -820,7 +845,7 @@ app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
         [
           id_nueva_ocurrencia,
           detalle_llamada.numero_telefono,
-          detalle_llamada.nombre_informante || "Anónimo",
+          detalle_llamada.nombre_informante || "Sin dato",
         ],
       );
     }
@@ -868,10 +893,7 @@ app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
     res.status(201).json({ success: true, id: id_nueva_ocurrencia });
 
     // =========================================================
-    // PROCESAR Y SUBIR FOTOS A R2 EN SEGUNDO PLANO
-    // =========================================================
-    // =========================================================
-    // PROCESAR Y SUBIR FOTOS A R2 EN SEGUNDO PLANO
+    // PROCESAR Y SUBIR FOTOS EN SEGUNDO PLANO
     // =========================================================
     if (fotos && Array.isArray(fotos) && fotos.length > 0) {
       procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(
@@ -893,6 +915,7 @@ app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
     if (connection) connection.release();
   }
 });
+
 
 
 
