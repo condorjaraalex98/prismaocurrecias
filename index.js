@@ -11075,8 +11075,8 @@ const fechaActual = new Date();
       descripcion || "Fin de Servicio", hora_alerta || null, hora_alerta || null, hora_alerta || null,
       id_lugar, id_usuario, id_modalidad, id_modalidad, id_origen || 9,
       id_tipop || null, id_modalidadp || null, latitud_gps || 0, longitud_gps || 0,
-      nombre_punto_gps || "", referencia || "", unidad_encargada || "SERENAZGO",
-      fecha_evento,fechaReportePeru, estadoOcurrencia, grupo, turno || null,
+      nombre_punto_gps || "", referencia || "", unidad_encargada || "SERENAZGO",fechaReportePeru,
+      fecha_evento, estadoOcurrencia, grupo, turno || null,
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
