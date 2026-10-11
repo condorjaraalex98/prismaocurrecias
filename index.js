@@ -477,7 +477,7 @@ app.post("/ocurrencias/registrar/modr2x", async (req, res) => {
 // INICIO DEL SERVIDOR
 // ==========================================
 
-app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
+app.post("/ocurrencias/registrar/modr2", async (req, res) => {
   let connection;
   try {
     const {
@@ -520,7 +520,7 @@ const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America
             id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
             nombre_punto_gps, referencia, unidad_encargada, 
             fecha_reporte, fecha_evento, estado, grupo, turno
-        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
       descripcion,                     // 1
@@ -540,7 +540,7 @@ const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America
       nombre_punto_gps || "",          // 15
       referencia || "",                // 16
       unidad_encargada || "SERENAZGO",
-      fechaReportePeru,// 17
+  
       fecha_evento,                    // 18
       estadoOcurrencia,                // 19
       grupo,                           // 20
@@ -690,7 +690,7 @@ const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America
 // INICIO DEL SERVIDOR
 // ==========================================
 
-app.post("/ocurrencias/registrar/modr2", async (req, res) => {
+app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
   let connection;
   try {
     const {
