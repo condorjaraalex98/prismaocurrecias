@@ -10881,8 +10881,19 @@ app.post("/api/vehiculo/iniciar-servicio", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
-  
+
+const fechaActual = new Date();
+    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
+    const fechaPeruObj = new Date(formatoPeru);
+
+    const anio = fechaPeruObj.getFullYear();
+    const mes = String(fechaPeruObj.getMonth() + 1).padStart(2, "0");
+    const dia = String(fechaPeruObj.getDate()).padStart(2, "0");
+    const hora = String(fechaPeruObj.getHours()).padStart(2, "0");
+    const minuto = String(fechaPeruObj.getMinutes()).padStart(2, "0");
+    const segundo = String(fechaPeruObj.getSeconds()).padStart(2, "0");
+
+    const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
         descripcion, hora_alerta, hora_llegada, hora_repliegue, 
         id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
@@ -11039,8 +11050,19 @@ app.post("/api/vehiculo/finalizar-servicio", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
-  
+
+const fechaActual = new Date();
+    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
+    const fechaPeruObj = new Date(formatoPeru);
+
+    const anio = fechaPeruObj.getFullYear();
+    const mes = String(fechaPeruObj.getMonth() + 1).padStart(2, "0");
+    const dia = String(fechaPeruObj.getDate()).padStart(2, "0");
+    const hora = String(fechaPeruObj.getHours()).padStart(2, "0");
+    const minuto = String(fechaPeruObj.getMinutes()).padStart(2, "0");
+    const segundo = String(fechaPeruObj.getSeconds()).padStart(2, "0");
+
+    const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
         descripcion, hora_alerta, hora_llegada, hora_repliegue, 
         id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
