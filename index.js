@@ -477,7 +477,7 @@ app.post("/ocurrencias/registrar/modr2x", async (req, res) => {
 // INICIO DEL SERVIDOR
 // ==========================================
 
-app.post("/ocurrencias/registrar/modr2", async (req, res) => {
+app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
   let connection;
   try {
     const {
@@ -690,7 +690,7 @@ const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America
 // INICIO DEL SERVIDOR
 // ==========================================
 
-app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
+app.post("/ocurrencias/registrar/modr2", async (req, res) => {
   let connection;
   try {
     const {
@@ -724,25 +724,19 @@ app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
 
     connection = await db.getConnection();
     await connection.beginTransaction();
-    const opciones = { 
-  timeZone: "America/Lima", 
-  year: 'numeric', 
-  month: '2-digit', 
-  day: '2-digit', 
-  hour: '2-digit', 
-  minute: '2-digit', 
-  second: '2-digit', 
-  hour12: false 
-};
-const partesFecha = new Intl.DateTimeFormat('sv-SE', opciones).formatToParts(new Date());
 
-const anio = partesFecha.find(p => p.type === 'year').value;
-const mes = partesFecha.find(p => p.type === 'month').value;
-const dia = partesFecha.find(p => p.type === 'day').value;
-const hora = partesFecha.find(p => p.type === 'hour').value;
-const minuto = partesFecha.find(p => p.type === 'minute').value;
-const segundo = partesFecha.find(p => p.type === 'second').value;
-const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
+const fechaActual = new Date();
+    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
+    const fechaPeruObj = new Date(formatoPeru);
+
+    const anio = fechaPeruObj.getFullYear();
+    const mes = String(fechaPeruObj.getMonth() + 1).padStart(2, "0");
+    const dia = String(fechaPeruObj.getDate()).padStart(2, "0");
+    const hora = String(fechaPeruObj.getHours()).padStart(2, "0");
+    const minuto = String(fechaPeruObj.getMinutes()).padStart(2, "0");
+    const segundo = String(fechaPeruObj.getSeconds()).padStart(2, "0");
+
+    const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
    // 1. INSERTAR OCURRENCIA PRINCIPAL
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
             descripcion, hora_alerta, hora_llegada, hora_repliegue, 
