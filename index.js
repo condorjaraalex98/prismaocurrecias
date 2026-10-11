@@ -77,21 +77,23 @@ function limpiarUrlR2(input) {
   // 2. Limpiar corchetes, comillas y espacios sobrantes
   texto = texto.replace(/[\[\]'"]+/g, "").trim();
 
-  // 3. Extraer estrictamente la primera URL válida que comience con http o https
+  // 3. Manejo seguro de URLs duplicadas o concatenadas sin espacios
+  const domain = "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
+  if (texto.includes(domain)) {
+    // Partimos el texto por "https://" para aislar los bloques correctos
+    const partes = texto.split("https://");
+    // Buscamos desde el final la última parte que contenga el dominio de R2
+    const parteValida = partes.reverse().find((p) => p.includes(domain));
+    if (parteValida) {
+      texto = "https://" + parteValida;
+    }
+  }
+
+  // 4. Extraer estrictamente la URL limpia resultante
   const matchHttp = texto.match(/(https?:\/\/[^\s\)]+)/);
   if (!matchHttp) return null;
 
   let urlPura = matchHttp[1];
-
-  // 4. Cortar si hay duplicaciones del dominio de Cloudflare
-  const domain = "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
-  const firstIdx = urlPura.indexOf(domain);
-  if (firstIdx !== -1) {
-    const secondIdx = urlPura.indexOf(domain, firstIdx + domain.length);
-    if (secondIdx !== -1) {
-      urlPura = urlPura.slice(0, secondIdx);
-    }
-  }
 
   // 5. Asegurar limpieza de cualquier carácter extraño al final
   const finLimpio = urlPura.match(/[^\s\)]+/);
