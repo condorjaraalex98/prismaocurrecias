@@ -6952,12 +6952,11 @@ app.get("/ocurrencias/listar/tablasipcop-rango", async (req, res) => {
   }
 });
 
-app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
+app.get("/ocurrencias/listar/tablasipcop-rango12hrol", async (req, res) => {
   let connection;
   try {
     connection = await db.getConnection();
 
-    // 1. Paginación
     const page = Math.max(1, parseInt(req.query.page || req.query.pagina) || 1);
     const limit = Math.min(
       Math.max(1, parseInt(req.query.limit || req.query.limite) || 50),
@@ -6965,21 +6964,30 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
     );
     const offset = (page - 1) * limit;
 
-    // 2. Parámetros de rango (Soporta camelCase del frontend y snake_case)
     const fecha_inicio = req.query.fechaInicio || req.query.fecha_inicio;
     const fecha_fin = req.query.fechaFin || req.query.fecha_fin;
+    
+    // RECIBIMOS EL ID DEL USUARIO DESDE LA SESIÓN
+    const idUsuarioLogueado = req.query.id_usuario;
 
-    let whereClause = "";
+    let whereConditions = [];
     const paramsWhere = [];
 
-   if (fecha_inicio && fecha_fin) {
-  whereClause = `WHERE o.fecha_reporte BETWEEN ? AND ?`;
-  paramsWhere.push(fecha_inicio, fecha_fin);
-} else {
-  // Garantiza el filtro automático de las últimas 12 horas al cargar por primera vez
-  whereClause = `WHERE o.fecha_reporte >= NOW() - INTERVAL 12 HOUR`;
-}
-    // 3. Conteo total exacto de ocurrencias
+    if (fecha_inicio && fecha_fin) {
+      whereConditions.push(`o.fecha_reporte BETWEEN ? AND ?`);
+      paramsWhere.push(fecha_inicio, fecha_fin);
+    } else {
+      whereConditions.push(`o.fecha_reporte >= NOW() - INTERVAL 12 HOUR`);
+    }
+
+   // Si el frontend envía el id_usuario, filtramos estrictamente los registros de ese usuario
+    if (idUsuarioLogueado) {
+      whereConditions.push(`o.id_usuario = ?`);
+      paramsWhere.push(idUsuarioLogueado);
+    }
+
+    const whereClause = `WHERE ` + whereConditions.join(" AND ");
+
     const countSql = `
       SELECT COUNT(o.id_ocurrencia) AS total 
       FROM ocurrencia_registro o
@@ -6988,7 +6996,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
     const [countRows] = await connection.query(countSql, paramsWhere);
     const totalRegistros = countRows[0]?.total || 0;
 
-    // 4. Consulta principal optimizada (Sin JOINs multiplicativos)
+    // 4. Consulta principal con la comparación añadida
     const sql = `
         SELECT 
             o.id_ocurrencia,
@@ -6999,6 +7007,16 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
             o.hora_repliegue,
             o.distancia_metros,
             o.referencia,
+            o.turno,
+            o.turnr,
+            o.turnrm,
+            
+            -- COMPARACIÓN DIRECTAMENTE EN SQL: Compara 'turno' con 'turnr' y 'turnrm'
+            CASE 
+                WHEN o.turno = o.turnr OR o.turno = o.turnrm THEN 'Sí'
+                ELSE 'No'
+            END AS turno_coincide,
+
             o.unidad_encargada,
             o.descripcion AS ocurrencia_descripcion,
             o.codigo_seguimiento,
@@ -7006,51 +7024,60 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
             o.patrimonio_real,
             o.arresto_ciudadano,
             
-            -- Datos de Persona y Usuario
-            CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS persona_nombre_completo,
-            p.documento_numero AS persona_dni,
-            
-            -- Datos de Llamada, Origen, Modalidad y Ubicación
-            dlo.numero_telefono,
-            dlo.nombre_informante,
-            m.nombre AS modalidad_nombre,
-            ori.descripcion AS origen_descripcion,
-            tp.nombre AS tipo_patrullaje_nombre,
-            l.nombre_lugar,
-            v.nombre_via AS via_nombre,
+           -- Datos de Persona y Usuario
+           CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS persona_nombre_completo,
+           p.documento_numero AS persona_dni,
+   
+           -- Datos de Llamada, Origen, Modalidad y Ubicación
+           dlo.numero_telefono,
+           dlo.nombre_informante,
+           m.nombre AS modalidad_nombre,
+           ori.descripcion AS origen_descripcion,
+           tp.nombre AS tipo_patrullaje_nombre,
+           l.nombre_lugar,
+           v.nombre_via AS via_nombre,
+    
+           -- Subconsulta corregida para el PNP
+           (SELECT CONCAT_WS(' ', pnp_sub.grado, pnp_sub.nombres, pnp_sub.apellidos)
+            FROM ocurrencia_vehiculo_detalle ovd_sub
+            INNER JOIN cat_pnp pnp_sub ON ovd_sub.id_pnp = pnp_sub.id_pnp
+            WHERE ovd_sub.id_ocurrencia = o.id_ocurrencia AND ovd_sub.id_pnp IS NOT NULL
+            LIMIT 1
+           ) AS pnp_nombre_completo,
 
-          (SELECT COALESCE(
-                JSON_ARRAYAGG(
-                    IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
-                       CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
-                       spf.placa)
-                ),
-                JSON_ARRAY()
-             )
-             FROM ocurrencia_vehiculo_detalle ovd
-             LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
-             LEFT JOIN tipo_vehiculo tvh ON ovd.id_tipo_vehiculo = tvh.id_tipo_vehiculo
-             WHERE ovd.id_ocurrencia = o.id_ocurrencia
-            ) AS vehiculos_json,
+           -- Subconsulta JSON: Vehículos
+           (SELECT COALESCE(
+               JSON_ARRAYAGG(
+                   IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
+                      CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
+                      spf.placa)
+               ),
+               JSON_ARRAY()
+              )
+            FROM ocurrencia_vehiculo_detalle ovd
+            LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
+            LEFT JOIN tipo_vehiculo tvh ON ovd.id_tipo_vehiculo = tvh.id_tipo_vehiculo
+            WHERE ovd.id_ocurrencia = o.id_ocurrencia
+           ) AS vehiculos_json,
 
-            -- Subconsulta JSON: Cámaras
-            (SELECT COALESCE(
-                JSON_ARRAYAGG(camar.nombre_camara),
-                JSON_ARRAY()
-             ) 
-             FROM detalle_camara_ocurrencia dcam 
-             INNER JOIN camara camar ON dcam.id_camara = camar.id_camara 
-             WHERE dcam.id_ocurrencia = o.id_ocurrencia
-            ) AS camaras_json,
-            
-            -- Subconsulta JSON: Fotos
-            (SELECT COALESCE(
-                JSON_ARRAYAGG(f.url_imagen),
-                JSON_ARRAY()
-             ) 
-             FROM foto_ocurrencia_registro f 
-             WHERE f.id_ocurrencia = o.id_ocurrencia AND f.url_imagen IS NOT NULL
-            ) AS fotos_json
+           -- Subconsulta JSON: Cámaras
+           (SELECT COALESCE(
+               JSON_ARRAYAGG(camar.nombre_camara),
+               JSON_ARRAY()
+              ) 
+            FROM detalle_camara_ocurrencia dcam 
+            INNER JOIN camara camar ON dcam.id_camara = camar.id_camara 
+            WHERE dcam.id_ocurrencia = o.id_ocurrencia
+           ) AS camaras_json,
+    
+           -- Subconsulta JSON: Fotos
+           (SELECT COALESCE(
+               JSON_ARRAYAGG(f.url_imagen),
+               JSON_ARRAY()
+              ) 
+            FROM foto_ocurrencia_registro f 
+            WHERE f.id_ocurrencia = o.id_ocurrencia AND f.url_imagen IS NOT NULL
+           ) AS fotos_json
 
         FROM ocurrencia_registro o
         LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
@@ -7058,10 +7085,9 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
         LEFT JOIN lugar l ON o.id_lugar = l.id_lugar
         LEFT JOIN via v ON l.id_via = v.id_via
         LEFT JOIN origen ori ON o.id_origen = ori.id_origen 
-        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+        LEFT JOIN cat_modalidad m ON o.id_modalidad_inicial = m.id
         LEFT JOIN tipo_patrullaje tp ON o.id_tipop = tp.id_tipop
         LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
-
         ${whereClause}
 
         ORDER BY o.fecha_reporte DESC 
@@ -7071,32 +7097,52 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hseg", async (req, res) => {
     const queryParams = [...paramsWhere, limit, offset];
     const [rows] = await connection.query(sql, queryParams);
 
-    // 5. Mapeo seguro de arrays JSON
+    // 5. Mapeo seguro de arrays JSON y datos adicionales
     const datosMapeados = rows.map((item) => {
       let listaFotos = [];
       let listaCamaras = [];
       let listaVehiculos = [];
 
-      try { listaFotos = item.fotos_json ? JSON.parse(item.fotos_json) : []; } catch (e) {}
-      try { listaCamaras = item.camaras_json ? JSON.parse(item.camaras_json) : []; } catch (e) {}
-      try { listaVehiculos = item.vehiculos_json ? JSON.parse(item.vehiculos_json) : []; } catch (e) {}
+      try {
+        if (item.fotos_json) {
+          listaFotos = Array.isArray(item.fotos_json) ? item.fotos_json : JSON.parse(item.fotos_json);
+        }
+      } catch (e) {
+        listaFotos = [];
+      }
+
+      try {
+        if (item.camaras_json) {
+          listaCamaras = Array.isArray(item.camaras_json) ? item.camaras_json : JSON.parse(item.camaras_json);
+        }
+      } catch (e) {
+        listaCamaras = [];
+      }
+
+      try {
+        if (item.vehiculos_json) {
+          listaVehiculos = Array.isArray(item.vehiculos_json) ? item.vehiculos_json : JSON.parse(item.vehiculos_json);
+        }
+      } catch (e) {
+        listaVehiculos = [];
+      }
+
+      listaFotos = listaFotos.filter((f) => f && f !== "null" && f !== "");
 
       return {
         ...item,
         fecha_evento: item.fecha_evento || "S/F",
         fecha_reporte: item.fecha_reporte || "S/F",
-        
-        // Mantenemos retrocompatibilidad con campos de UI
-        placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin unidad",
+        placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin dato",
         vehiculos: listaVehiculos,
         camaras: listaCamaras,
-        
-        // Fotos
         total_fotos: listaFotos.length,
         tiene_fotos: listaFotos.length > 0,
         foto_principal: listaFotos[0] || null,
         fotos: listaFotos,
-        lista_fotos: listaFotos
+        lista_fotos: listaFotos,
+        // El resultado de la comparación ya viene calculado desde MySQL
+        turno_coincide: item.turno_coincide || "No"
       };
     });
 
@@ -7171,6 +7217,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango12h", async (req, res) => {
             o.hora_repliegue,
             o.distancia_metros,
             o.referencia,
+          
             o.unidad_encargada,
             o.descripcion AS ocurrencia_descripcion,
             o.codigo_seguimiento,
@@ -7628,523 +7675,200 @@ app.get("/ocurrencias/listar/exportarformato", async (req, res) => {
   }
 });
 
-app.get(
-  "/ocurrencias/listar/exportarformatopaginacionback",
-  async (req, res) => {
-    let connection;
-    try {
-      connection = await db.getConnection();
 
-      // Parámetros de paginación y filtros opcionales (por defecto año actual y 25 por página)
-      const anio = req.query.anio || new Date().getFullYear();
-      const limit = parseInt(req.query.limit) || 25;
-      const page = parseInt(req.query.page) || 1;
-      const offset = (page - 1) * limit;
 
-      // A. Obtener el total de registros y el conteo por estados de forma rápida (sin joins pesados)
-      const [sqlTotales] = await connection.query(
-        `SELECT 
-         COUNT(*) AS total_registros,
-         SUM(CASE WHEN UPPER(estado) = 'PENDIENTE' THEN 1 ELSE 0 END) as c_pendiente,
-         SUM(CASE WHEN UPPER(estado) = 'SIPCOP' THEN 1 ELSE 0 END) as c_sipcop,
-         SUM(CASE WHEN UPPER(estado) = 'VERIFICADO' THEN 1 ELSE 0 END) as c_verificado,
-         SUM(CASE WHEN UPPER(estado) = 'ANULADO' THEN 1 ELSE 0 END) as c_anulado
-       FROM ocurrencia_registro 
-       WHERE YEAR(fecha_reporte) = ?`,
-        [anio],
-      );
-
-      const totalRegistros = sqlTotales[0]?.total_registros || 0;
-      const totalPaginas = Math.ceil(totalRegistros / limit) || 1;
-
-      const conteosEstados = {
-        PENDIENTE: sqlTotales[0]?.c_pendiente || 0,
-        SIPCOP: sqlTotales[0]?.c_sipcop || 0,
-        VERIFICADO: sqlTotales[0]?.c_verificado || 0,
-        ANULADO: sqlTotales[0]?.c_anulado || 0,
-      };
-
-      // B. Consulta principal paginada (Solo procesa los IDs de la página actual)
-      const sqlPaginated = `
-        WITH ocurrencias_paginadas AS (
-            SELECT id_ocurrencia
-            FROM ocurrencia_registro
-            WHERE YEAR(fecha_reporte) = ?
-            ORDER BY fecha_reporte DESC
-            LIMIT ? OFFSET ?
-        ),
-        pnp_base AS (
-            SELECT ovd.id_ocurrencia, ovd.id_detalle, cp.apellidos, cp.nombres, cp.dni, cp.grado
-            FROM ocurrencia_vehiculo_detalle ovd
-            INNER JOIN cat_pnp cp ON ovd.id_pnp = cp.id_pnp
-            INNER JOIN ocurrencias_paginadas op ON ovd.id_ocurrencia = op.id_ocurrencia
-        ),
-        pnp_numbered AS (
-            SELECT 
-                id_ocurrencia,
-                ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle) AS pos,
-                CONCAT('(', ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle), ') ', CONCAT(IFNULL(apellidos, ''), ', ', IFNULL(nombres, ''), ' (DNI: ', IFNULL(dni, '-'), ', Grado: ', IFNULL(grado, '-'), ')')) AS texto_pnp
-            FROM pnp_base
-        ),
-        pnp_agg AS (
-            SELECT 
-                id_ocurrencia,
-                GROUP_CONCAT(texto_pnp ORDER BY pos SEPARATOR '\n') AS pnp_datos
-            FROM pnp_numbered
-            GROUP BY id_ocurrencia
-        ),
-        vic_base AS (
-            SELECT dv.id_ocurrencia, dv.id_detalle_victima, dv.nombre_victima, dv.edad, dv.placa_victima, rv.descripcion AS rel_desc
-            FROM detalle_victimas_ocurrencia dv
-            INNER JOIN ocurrencias_paginadas op ON dv.id_ocurrencia = op.id_ocurrencia
-            LEFT JOIN sipcop_relacion_v rv ON dv.id_relacion_v = rv.id_relacion_v
-        ),
-        vic_numbered AS (
-            SELECT 
-                id_ocurrencia,
-                ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle_victima) AS pos,
-                nombre_victima, edad, placa_victima, rel_desc
-            FROM vic_base
-        ),
-        vic_grouped AS (
-            SELECT 
-                id_ocurrencia,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(nombre_victima, 'NO IDENTIFICADO')) ORDER BY pos SEPARATOR '\n') AS victimas_nombres,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(CAST(edad AS CHAR), '')) ORDER BY pos SEPARATOR '\n') AS victimas_edades,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(placa_victima, '')) ORDER BY pos SEPARATOR '\n') AS victimas_placas,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(rel_desc, 'SIN RELACIÓN')) ORDER BY pos SEPARATOR '\n') AS victimas_relacion
-            FROM vic_numbered
-            GROUP BY id_ocurrencia
-        ),
-        agr_base AS (
-            SELECT da.id_ocurrencia, da.id_detalle_agresor, da.nombre_agresor, da.edad, da.placa_agresor
-            FROM detalle_agresores_ocurrencia da
-            INNER JOIN ocurrencias_paginadas op ON da.id_ocurrencia = op.id_ocurrencia
-        ),
-        agr_numbered AS (
-            SELECT 
-                id_ocurrencia,
-                ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle_agresor) AS pos,
-                nombre_agresor, edad, placa_agresor
-            FROM agr_base
-        ),
-        agr_grouped AS (
-            SELECT 
-                id_ocurrencia,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(nombre_agresor, 'NO IDENTIFICADO')) ORDER BY pos SEPARATOR '\n') AS agresores_nombres,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(CAST(edad AS CHAR), '')) ORDER BY pos SEPARATOR '\n') AS agresores_edades,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(placa_agresor, '')) ORDER BY pos SEPARATOR '\n') AS agresores_placas
-            FROM agr_numbered
-            GROUP BY id_ocurrencia
-        ),
-        foto_base AS (
-            SELECT f.id_ocurrencia, f.url_imagen, ROW_NUMBER() OVER (PARTITION BY f.id_ocurrencia ORDER BY f.id_foto) AS nro
-            FROM foto_ocurrencia_registro f
-            INNER JOIN ocurrencias_paginadas op ON f.id_ocurrencia = op.id_ocurrencia
-        ),
-        foto_agg AS (
-            SELECT 
-                id_ocurrencia,
-                COUNT(*) AS total_fotos,
-                MAX(CASE WHEN nro = 1 THEN url_imagen END) AS foto_principal,
-                MAX(CASE WHEN nro = 1 THEN url_imagen END) AS foto_1,
-                MAX(CASE WHEN nro = 2 THEN url_imagen END) AS foto_2,
-                MAX(CASE WHEN nro = 3 THEN url_imagen END) AS foto_3,
-                MAX(CASE WHEN nro = 4 THEN url_imagen END) AS foto_4
-            FROM foto_base 
-            GROUP BY id_ocurrencia
-        )
-        SELECT 
-            o.id_ocurrencia,
-            o.fecha_reporte,
-            o.estado_involucrados,
-            o.tipo_servicio_global,
-            o.turnr,
-            ANY_VALUE(tvh.descripcion) AS vehiculo_tipo,
-            ANY_VALUE(spf.placa) AS vehiculo_placa,
-            o.estado,
-            ANY_VALUE(cgen.nombre) AS cat_generica_nombre,
-            ANY_VALUE(cesp.nombre) AS cat_especifica_nombre,
-            CONCAT(o.latitud_gps, ' ', o.longitud_gps) AS coordenada,
-            o.patrimonio_real,
-            o.arresto_ciudadano,
-            o.distancia_metros,
-            ANY_VALUE(CONCAT_WS(' ', pnp.grado, pnp.nombres, pnp.apellidos)) AS pnp_nombre_completo,
-            ANY_VALUE(IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
-                CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
-                spf.placa
-            )) AS placa_con_tipo,
-            ANY_VALUE(ovd.tipo_asignacion) AS tipo_asignacion,
-            o.codigo_seguimiento,
-            ANY_VALUE(ori.descripcion) AS origen_descripcion,
-            o.fecha_evento,
-            o.hora_alerta,
-            o.hora_llegada,
-            o.hora_repliegue,
-            o.descripcion AS ocurrencia_descripcion,
-            ANY_VALUE(l.nombre_lugar) AS nombre_lugar,
-            o.unidad_encargada,
-            o.referencia,
-            ANY_VALUE(m.codigo) AS codmod, 
-            ANY_VALUE(p.documento_numero) AS persona_dni,
-            ANY_VALUE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres)) AS persona_nombre_completo,
-            ANY_VALUE(m.nombre) AS modalidad_nombre,
-            ANY_VALUE(v.nombre_via) AS via_nombre,
-            ANY_VALUE(c.numero_cuadra) AS cuadra,
-            ANY_VALUE(tp.nombre) AS tipo_patrullaje_nombre,
-            ANY_VALUE(mp.nombre) AS mod_patrullaje_nombre,
-            ANY_VALUE(l.id_lugar) AS value, 
-            ANY_VALUE(CONCAT(COALESCE(tv.abreviatura, ''), ' ', COALESCE(v.nombre_via, ''), ' CDRA. ', COALESCE(c.numero_cuadra, ''))) AS label,
-            ANY_VALUE(dlo.numero_telefono) AS numero_telefono,
-            ANY_VALUE(dlo.nombre_informante) AS nombre_informante,
-            ANY_VALUE(SR.descripcion) AS resultado_des,
-            ANY_VALUE(SM.descripcion) AS medio_des,
-            ANY_VALUE(SL.descripcion) AS lugar_des,
-            ANY_VALUE(SC.descripcion) AS consecuencia_des,
-            pnp_agg.pnp_datos,
-            v_grp.victimas_nombres,
-            v_grp.victimas_edades,
-            v_grp.victimas_placas,
-            v_grp.victimas_relacion,
-            a_grp.agresores_nombres,
-            a_grp.agresores_edades,
-            a_grp.agresores_placas,
-            foto_agg.foto_1,
-            foto_agg.foto_2,
-            foto_agg.foto_3,
-            foto_agg.foto_4,
-            foto_agg.total_fotos,
-            foto_agg.foto_principal,
-            (
-              SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id_detalle_victima', dv_sub.id_detalle_victima, 'nombre_victima', dv_sub.nombre_victima, 'placa_victima', dv_sub.placa_victima, 'edad', dv_sub.edad, 'id_relacion_v', dv_sub.id_relacion_v)), '[]') AS CHAR) 
-              FROM detalle_victimas_ocurrencia dv_sub WHERE dv_sub.id_ocurrencia = o.id_ocurrencia
-            ) AS victimas_json,
-            (
-              SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id_detalle_agresor', da_sub.id_detalle_agresor, 'nombre_agresor', da_sub.nombre_agresor, 'placa_agresor', da_sub.placa_agresor, 'edad', da_sub.edad)), '[]') AS CHAR) 
-              FROM detalle_agresores_ocurrencia da_sub WHERE da_sub.id_ocurrencia = o.id_ocurrencia
-            ) AS agresores_json,
-            (SELECT CAST(JSON_ARRAYAGG(f.url_imagen) AS CHAR) FROM foto_ocurrencia_registro f WHERE f.id_ocurrencia = o.id_ocurrencia) AS fotos_json
-        FROM ocurrencias_paginadas op
-        INNER JOIN ocurrencia_registro o ON op.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
-        LEFT JOIN persona p ON us.id_persona = p.id_persona
-        LEFT JOIN lugar l ON o.id_lugar = l.id_lugar
-        LEFT JOIN via v ON l.id_via = v.id_via
-        LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
-        LEFT JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
-        INNER JOIN origen ori ON o.id_origen = ori.id_origen 
-        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-        LEFT JOIN ocurrencia_vehiculo_detalle ovd ON ovd.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
-        LEFT JOIN tipo_vehiculo tvh ON ovd.id_tipo_vehiculo = tvh.id_tipo_vehiculo
-        LEFT JOIN cat_pnp pnp ON ovd.id_pnp = pnp.id_pnp
-        LEFT JOIN tipo_patrullaje tp ON o.id_tipop = tp.id_tipop
-        LEFT JOIN modalidad_patrullaje mp ON o.id_modalidadp = mp.id_modalidadp
-        LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
-        LEFT JOIN cat_modalidad cmod ON o.id_modalidad = cmod.id
-        LEFT JOIN cat_especifica cesp ON cmod.especifica_id = cesp.id
-        LEFT JOIN cat_generica cgen ON cesp.generica_id = cgen.id
-        LEFT JOIN sipcop_resultado SR ON SR.id_resultado = o.id_resultado_real
-        LEFT JOIN sipcop_medio SM ON SM.id_medio = o.id_medio_real
-        LEFT JOIN sipcop_lugar SL ON SL.id_lugarsip = o.id_lugar_real
-        LEFT JOIN sipcop_consecuencia SC ON SC.id_consecuencia = o.id_consecuencia_real
-        LEFT JOIN pnp_agg ON pnp_agg.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN vic_grouped v_grp ON v_grp.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN agr_grouped a_grp ON a_grp.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN foto_agg foto_agg ON foto_agg.id_ocurrencia = o.id_ocurrencia
-        GROUP BY o.id_ocurrencia, o.fecha_reporte, o.estado, o.patrimonio_real, o.arresto_ciudadano, 
-                 o.distancia_metros, o.codigo_seguimiento, o.fecha_evento, o.hora_alerta, 
-                 o.hora_llegada, o.hora_repliegue, o.descripcion, o.unidad_encargada, o.referencia,
-                 o.latitud_gps, o.longitud_gps, o.turnr, o.id_resultado_real, o.id_medio_real, 
-                 o.id_lugar_real, o.id_consecuencia_real, o.id_origen, o.id_modalidad, o.id_tipop, o.id_modalidadp,
-                 o.estado_involucrados, pnp_agg.pnp_datos, v_grp.victimas_nombres, v_grp.victimas_edades, 
-                 v_grp.victimas_placas, v_grp.victimas_relacion, a_grp.agresores_nombres, a_grp.agresores_edades, 
-                 a_grp.agresores_placas, foto_agg.total_fotos, foto_agg.foto_principal, foto_agg.foto_1, 
-                 foto_agg.foto_2, foto_agg.foto_3, foto_agg.foto_4
-        ORDER BY o.fecha_reporte DESC;
-    `;
-
-      const [rows] = await connection.query(sqlPaginated, [
-        anio,
-        limit,
-        offset,
-      ]);
-
-      const respuestaMapeada = rows.map((item) => {
-        let listaFotosUrls = [];
-        let listaVictimas = [];
-        let listaAgresores = [];
-
-        try {
-          listaFotosUrls = item.fotos_json ? JSON.parse(item.fotos_json) : [];
-        } catch (e) {}
-        try {
-          listaVictimas = item.victimas_json
-            ? JSON.parse(item.victimas_json)
-            : [];
-        } catch (e) {}
-        try {
-          listaAgresores = item.agresores_json
-            ? JSON.parse(item.agresores_json)
-            : [];
-        } catch (e) {}
-
-        const primeraVictima = listaVictimas[0] || {};
-        const primerAgresor = listaAgresores[0] || {};
-
-        return {
-          ...item,
-          victimas: listaVictimas,
-          agresores: listaAgresores,
-          nombre_victima: primeraVictima.nombre_victima || null,
-          edad_victima: primeraVictima.edad || null,
-          relacion_victima: primeraVictima.id_relacion_v || null,
-          nombre_agresor: primerAgresor.nombre_agresor || null,
-          edad_agresor: primerAgresor.edad || null,
-          placa_agresor: primerAgresor.placa_agresor || null,
-          identificado:
-            listaVictimas.length > 0 || listaAgresores.length > 0
-              ? "IDENTIFICADO"
-              : "NO_IDENTIFICADO",
-          pnp_completo: item.pnp_nombre_completo || "No asignado",
-          fecha_evento: item.fecha_evento
-            ? new Date(item.fecha_evento).toISOString().split("T")[0]
-            : "S/F",
-          tiene_fotos: (item.total_fotos || 0) > 0,
-          fotos: listaFotosUrls,
-          lista_fotos: listaFotosUrls,
-        };
-      });
-
-      // Respuesta limpia y estructurada para el frontend
-      res.json({
-        success: true,
-        data: respuestaMapeada,
-        paginacion: {
-          totalRegistros,
-          totalPaginas,
-          paginaActual: page,
-        },
-        conteosEstados,
-      });
-    } catch (error) {
-      console.error("ERROR EN /ocurrencias/listar/exportarformato:", error);
-      res.status(500).json({ success: false, error: error.message });
-    } finally {
-      if (connection) connection.release();
-    }
-  },
-);
-
-app.get("/ocurrencias/listar/exportarango", async (req, res) => {
+app.get("/ocurrencias/listar/tablasipcop-avanzado", async (req, res) => {
   let connection;
   try {
     connection = await db.getConnection();
 
-    // 1. Capturamos las fechas desde los query params (ej. ?inicio=2026-08-01&fin=2026-09-02)
-    let { inicio, fin } = req.query;
+    const page = Math.max(1, parseInt(req.query.page || req.query.pagina) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit || req.query.limite) || 25), 100);
+    const offset = (page - 1) * limit;
 
-    // 2. Si no se envían fechas, por defecto asignamos el mes en curso (ej. del 1 de este mes hasta el 2 del siguiente)
-    if (!inicio || !fin) {
-      const fechaActual = new Date();
-      const anio = fechaActual.getFullYear();
-      const mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
+    const idUsuario = req.query.id_usuario;
+    const fecRepInicio = req.query.fecha_reporte_inicio;
+    const fecRepFin = req.query.fecha_reporte_fin;
+    const fecEvtInicio = req.query.fecha_evento_inicio;
+    const fecEvtFin = req.query.fecha_evento_fin;
+    
+    // Limpieza de arrays de filtros
+    const modalidades = req.query.modalidades ? req.query.modalidades.split(",").map(m => m.trim()).filter(Boolean) : [];
+    const estados = req.query.estados ? req.query.estados.split(",").map(e => e.trim()).filter(Boolean) : [];
+    
+    const patrimonioReal = req.query.patrimonio;
+    const arrestoCiudadano = req.query.arresto;
+    const tipoDelito = req.query.delito; // "robo_hurto"
 
-      inicio = `${anio}-${mes}-01`;
+    let whereConditions = [];
+    let paramsWhere = [];
 
-      // Calculamos el inicio del próximo mes + 2 días para cubrir completamente el rango que necesitas
-      const siguienteMes = new Date(anio, fechaActual.getMonth() + 1, 1);
-      const anioSig = siguienteMes.getFullYear();
-      const mesSig = String(siguienteMes.getMonth() + 1).padStart(2, "0");
-      fin = `${anioSig}-${mesSig}-02`;
+    // =========================================================================
+    // 1. MANEJO DE FECHAS
+    // =========================================================================
+    const tieneFiltroReporte = Boolean(fecRepInicio && fecRepFin);
+    const tieneFiltroEvento = Boolean(fecEvtInicio && fecEvtFin);
+
+    if (tieneFiltroReporte) {
+      whereConditions.push(`(o.fecha_reporte >= ? AND o.fecha_reporte <= ?)`);
+      paramsWhere.push(`${fecRepInicio} 00:00:00`, `${fecRepFin} 23:59:59`);
     }
 
+    if (tieneFiltroEvento) {
+      whereConditions.push(`(o.fecha_evento BETWEEN ? AND ?)`);
+      paramsWhere.push(fecEvtInicio, fecEvtFin);
+    }
+
+    if (!tieneFiltroReporte && !tieneFiltroEvento) {
+      whereConditions.push(`(o.fecha_reporte >= DATE_SUB(NOW(), INTERVAL 12 HOUR))`);
+    }
+
+    // =========================================================================
+    // 2. OTROS FILTROS
+    // =========================================================================
+    if (idUsuario) {
+      whereConditions.push(`(o.id_usuario = ?)`);
+      paramsWhere.push(idUsuario);
+    }
+
+    if (modalidades.length > 0) {
+      const placeholders = modalidades.map(() => "?").join(",");
+      whereConditions.push(`(m.nombre IN (${placeholders}))`);
+      paramsWhere.push(...modalidades);
+    }
+
+    if (estados.length > 0) {
+      const placeholders = estados.map(() => "?").join(",");
+      whereConditions.push(`(o.estado IN (${placeholders}))`);
+      paramsWhere.push(...estados);
+    }
+
+    if (patrimonioReal && patrimonioReal !== "") {
+      whereConditions.push(`(o.patrimonio_real = ?)`);
+      paramsWhere.push(patrimonioReal);
+    }
+
+    if (arrestoCiudadano && arrestoCiudadano !== "") {
+      whereConditions.push(`(o.arresto_ciudadano = ?)`);
+      paramsWhere.push(arrestoCiudadano);
+    }
+
+    if (tipoDelito === "robo_hurto") {
+      whereConditions.push(`(LOWER(o.descripcion) LIKE '%robo%' OR LOWER(o.descripcion) LIKE '%hurto%')`);
+    }
+
+    const whereClause = "WHERE " + whereConditions.join(" AND ");
+
+    // 1. Conteo total general
+    const countSql = `
+      SELECT COUNT(o.id_ocurrencia) AS total 
+      FROM ocurrencia_registro o
+      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+      ${whereClause}
+    `;
+    const [countRows] = await connection.query(countSql, paramsWhere);
+    const totalRegistros = countRows[0]?.total || 0;
+
+    // 2. Conteo por estados
+    const countEstadosSql = `
+      SELECT COALESCE(o.estado, 'SIN ESTADO') AS estado, COUNT(o.id_ocurrencia) AS cantidad
+      FROM ocurrencia_registro o
+      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+      ${whereClause}
+      GROUP BY o.estado
+    `;
+    const [estadosRows] = await connection.query(countEstadosSql, paramsWhere);
+    
+    const conteosPorEstado = {};
+    estadosRows.forEach(row => {
+      conteosPorEstado[String(row.estado).toUpperCase()] = row.cantidad;
+    });
+
+    // 3. Consulta Principal Avanzada (Con todas las relaciones y subconsultas integradas)
     const sql = `
-        WITH pnp_base AS (
-            SELECT ovd.id_ocurrencia, ovd.id_detalle, cp.apellidos, cp.nombres, cp.dni, cp.grado
-            FROM ocurrencia_vehiculo_detalle ovd
-            INNER JOIN cat_pnp cp ON ovd.id_pnp = cp.id_pnp
-        ),
-        pnp_numbered AS (
-            SELECT 
-                id_ocurrencia,
-                ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle) AS pos,
-                CONCAT('(', ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle), ') ', CONCAT(IFNULL(apellidos, ''), ', ', IFNULL(nombres, ''), ' (DNI: ', IFNULL(dni, '-'), ', Grado: ', IFNULL(grado, '-'), ')')) AS texto_pnp
-            FROM pnp_base
-        ),
-        pnp_agg AS (
-            SELECT 
-                id_ocurrencia,
-                GROUP_CONCAT(texto_pnp ORDER BY pos SEPARATOR '\n') AS pnp_datos
-            FROM pnp_numbered
-            GROUP BY id_ocurrencia
-        ),
-        vic_base AS (
-            SELECT dv.id_ocurrencia, dv.id_detalle_victima, dv.nombre_victima, dv.edad, dv.placa_victima, rv.descripcion AS rel_desc
-            FROM detalle_victimas_ocurrencia dv
-            LEFT JOIN sipcop_relacion_v rv ON dv.id_relacion_v = rv.id_relacion_v
-        ),
-        vic_numbered AS (
-            SELECT 
-                id_ocurrencia,
-                ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle_victima) AS pos,
-                nombre_victima, edad, placa_victima, rel_desc
-            FROM vic_base
-        ),
-        vic_grouped AS (
-            SELECT 
-                id_ocurrencia,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(nombre_victima, 'NO IDENTIFICADO')) ORDER BY pos SEPARATOR '\n') AS victimas_nombres,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(CAST(edad AS CHAR), '')) ORDER BY pos SEPARATOR '\n') AS victimas_edades,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(placa_victima, '')) ORDER BY pos SEPARATOR '\n') AS victimas_placas,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(rel_desc, 'SIN RELACIÓN')) ORDER BY pos SEPARATOR '\n') AS victimas_relacion
-            FROM vic_numbered
-            GROUP BY id_ocurrencia
-        ),
-        agr_base AS (
-            SELECT id_ocurrencia, id_detalle_agresor, nombre_agresor, edad, placa_agresor
-            FROM detalle_agresores_ocurrencia
-        ),
-        agr_numbered AS (
-            SELECT 
-                id_ocurrencia,
-                ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_detalle_agresor) AS pos,
-                nombre_agresor, edad, placa_agresor
-            FROM agr_base
-        ),
-        agr_grouped AS (
-            SELECT 
-                id_ocurrencia,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(nombre_agresor, 'NO IDENTIFICADO')) ORDER BY pos SEPARATOR '\n') AS agresores_nombres,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(CAST(edad AS CHAR), '')) ORDER BY pos SEPARATOR '\n') AS agresores_edades,
-                GROUP_CONCAT(CONCAT('(', pos, ') ', IFNULL(placa_agresor, '')) ORDER BY pos SEPARATOR '\n') AS agresores_placas
-            FROM agr_numbered
-            GROUP BY id_ocurrencia
-        ),
-        foto_base AS (
-            SELECT id_ocurrencia, url_imagen, ROW_NUMBER() OVER (PARTITION BY id_ocurrencia ORDER BY id_foto) AS nro
-            FROM foto_ocurrencia_registro
-        ),
-        foto_agg AS (
-            SELECT 
-                id_ocurrencia,
-                COUNT(*) AS total_fotos,
-                MAX(CASE WHEN nro = 1 THEN url_imagen END) AS foto_principal,
-                MAX(CASE WHEN nro = 1 THEN url_imagen END) AS foto_1,
-                MAX(CASE WHEN nro = 2 THEN url_imagen END) AS foto_2,
-                MAX(CASE WHEN nro = 3 THEN url_imagen END) AS foto_3,
-                MAX(CASE WHEN nro = 4 THEN url_imagen END) AS foto_4
-            FROM foto_base 
-            GROUP BY id_ocurrencia
-        )
         SELECT 
             o.id_ocurrencia,
-            o.fecha_reporte,
-            o.estado_involucrados,
-            o.tipo_servicio_global,
-            o.turnr,
-            ANY_VALUE(tvh.descripcion) AS vehiculo_tipo,
-            ANY_VALUE(spf.placa) AS vehiculo_placa,
-            o.estado,
-            ANY_VALUE(cgen.nombre) AS cat_generica_nombre,
-            ANY_VALUE(cesp.nombre) AS cat_especifica_nombre,
-            CONCAT(o.latitud_gps, ' ', o.longitud_gps) AS coordenada,
-            o.patrimonio_real,
-            o.arresto_ciudadano,
-            o.distancia_metros,
-            ANY_VALUE(CONCAT_WS(' ', pnp.grado, pnp.nombres, pnp.apellidos)) AS pnp_nombre_completo,
-            ANY_VALUE(IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
-                CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
-                spf.placa
-            )) AS placa_con_tipo,
-            ANY_VALUE(ovd.tipo_asignacion) AS tipo_asignacion,
-            o.codigo_seguimiento,
-            ANY_VALUE(ori.descripcion) AS origen_descripcion,
-            o.fecha_evento,
+            DATE_FORMAT(o.fecha_reporte, '%d/%m/%Y %H:%i:%s') AS fecha_reporte,
+            DATE_FORMAT(o.fecha_evento, '%d/%m/%Y') AS fecha_evento,
             o.hora_alerta,
             o.hora_llegada,
             o.hora_repliegue,
-            o.descripcion AS ocurrencia_descripcion,
-            ANY_VALUE(l.nombre_lugar) AS nombre_lugar,
-            o.unidad_encargada,
+            o.distancia_metros,
             o.referencia,
-            ANY_VALUE(m.codigo) AS codmod, 
-            ANY_VALUE(p.documento_numero) AS persona_dni,
-            ANY_VALUE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres)) AS persona_nombre_completo,
-            ANY_VALUE(m.nombre) AS modalidad_nombre,
-            ANY_VALUE(v.nombre_via) AS via_nombre,
-            ANY_VALUE(c.numero_cuadra) AS cuadra,
-            ANY_VALUE(tp.nombre) AS tipo_patrullaje_nombre,
-            ANY_VALUE(mp.nombre) AS mod_patrullaje_nombre,
-            ANY_VALUE(l.id_lugar) AS value, 
-            ANY_VALUE(CONCAT(COALESCE(tv.abreviatura, ''), ' ', COALESCE(v.nombre_via, ''), ' CDRA. ', COALESCE(c.numero_cuadra, ''))) AS label,
+            o.turno,
+            o.turnr,
+            o.turnrm,
+            o.estado,
+            o.patrimonio_real,
+            o.arresto_ciudadano,
+            o.codigo_seguimiento,
+            o.descripcion AS ocurrencia_descripcion,
+            o.estado_involucrados,
+            o.tipo_servicio_global,
+            CONCAT(o.latitud_gps, ' ', o.longitud_gps) AS coordenada,
+            o.unidad_encargada,
             
-            ANY_VALUE(dlo.numero_telefono) AS numero_telefono,
-            ANY_VALUE(dlo.nombre_informante) AS nombre_informante,
+            CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS persona_nombre_completo,
+            p.documento_numero AS persona_dni,
             
-            ANY_VALUE(SR.descripcion) AS resultado_des,
-            ANY_VALUE(SM.descripcion) AS medio_des,
-            ANY_VALUE(SL.descripcion) AS lugar_des,
-            ANY_VALUE(SC.descripcion) AS consecuencia_des,
+            dlo.numero_telefono,
+            dlo.nombre_informante,
+            m.nombre AS modalidad_nombre,
+            m.codigo AS codmod,
+            cesp.nombre AS cat_especifica_nombre,
+            cgen.nombre AS cat_generica_nombre,
+            
+            ori.descripcion AS origen_descripcion,
+            tp.nombre AS tipo_patrullaje_nombre,
+            mp.nombre AS mod_patrullaje_nombre,
+            l.nombre_lugar,
+            v.nombre_via AS via_nombre,
+            c.numero_cuadra AS cuadra,
+            CONCAT(COALESCE(tv.abreviatura, ''), ' ', COALESCE(v.nombre_via, ''), ' CDRA. ', COALESCE(c.numero_cuadra, '')) AS label,
+            
+            SR.descripcion AS resultado_des,
+            SM.descripcion AS medio_des,
+            SL.descripcion AS lugar_des,
+            SC.descripcion AS consecuencia_des,
 
-            pnp_agg.pnp_datos,
+            tvh.descripcion AS vehiculo_tipo,
+            spf.placa AS vehiculo_placa,
+            IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
+                CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
+                spf.placa
+            ) AS placa_con_tipo,
+            ovd.tipo_asignacion,
 
-            v_grp.victimas_nombres,
-            v_grp.victimas_edades,
-            v_grp.victimas_placas,
-            v_grp.victimas_relacion,
+            (SELECT CONCAT_WS(' ', pnp_sub.grado, pnp_sub.nombres, pnp_sub.apellidos)
+             FROM ocurrencia_vehiculo_detalle ovd_sub
+             INNER JOIN cat_pnp pnp_sub ON ovd_sub.id_pnp = pnp_sub.id_pnp
+             WHERE ovd_sub.id_ocurrencia = o.id_ocurrencia AND ovd_sub.id_pnp IS NOT NULL
+             LIMIT 1
+            ) AS pnp_nombre_completo,
 
-            a_grp.agresores_nombres,
-            a_grp.agresores_edades,
-            a_grp.agresores_placas,
+            (SELECT COALESCE(JSON_ARRAYAGG(f.url_imagen), JSON_ARRAY()) 
+             FROM foto_ocurrencia_registro f 
+             WHERE f.id_ocurrencia = o.id_ocurrencia AND f.url_imagen IS NOT NULL
+            ) AS fotos_json,
 
-            foto_agg.foto_1,
-            foto_agg.foto_2,
-            foto_agg.foto_3,
-            foto_agg.foto_4,
-            foto_agg.total_fotos,
-            foto_agg.foto_principal,
-
-            (
-              SELECT CAST(
-                COALESCE(
-                  JSON_ARRAYAGG(
-                    JSON_OBJECT(
-                      'id_detalle_victima', dv_sub.id_detalle_victima,
-                      'nombre_victima', dv_sub.nombre_victima,
-                      'placa_victima', dv_sub.placa_victima,
-                      'edad', dv_sub.edad,
-                      'id_relacion_v', dv_sub.id_relacion_v
-                    )
-                  ), 
-                  '[]'
-                ) AS CHAR
-              ) 
-              FROM detalle_victimas_ocurrencia dv_sub 
-              WHERE dv_sub.id_ocurrencia = o.id_ocurrencia
+            (SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+                'id_detalle_victima', dv_sub.id_detalle_victima,
+                'nombre_victima', dv_sub.nombre_victima,
+                'edad', dv_sub.edad,
+                'placa_victima', dv_sub.placa_victima,
+                'id_relacion_v', dv_sub.id_relacion_v
+            )), '[]') AS CHAR)
+             FROM detalle_victimas_ocurrencia dv_sub WHERE dv_sub.id_ocurrencia = o.id_ocurrencia
             ) AS victimas_json,
 
-            (
-              SELECT CAST(
-                COALESCE(
-                  JSON_ARRAYAGG(
-                    JSON_OBJECT(
-                      'id_detalle_agresor', da_sub.id_detalle_agresor,
-                      'nombre_agresor', da_sub.nombre_agresor,
-                      'placa_agresor', da_sub.placa_agresor,
-                      'edad', da_sub.edad
-                    )
-                  ), 
-                  '[]'
-                ) AS CHAR
-              ) 
-              FROM detalle_agresores_ocurrencia da_sub 
-              WHERE da_sub.id_ocurrencia = o.id_ocurrencia
-            ) AS agresores_json,
-
-            (SELECT CAST(JSON_ARRAYAGG(f.url_imagen) AS CHAR) 
-             FROM foto_ocurrencia_registro f 
-             WHERE f.id_ocurrencia = o.id_ocurrencia) AS fotos_json
+            (SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+                'id_detalle_agresor', da_sub.id_detalle_agresor,
+                'nombre_agresor', da_sub.nombre_agresor,
+                'edad', da_sub.edad,
+                'placa_agresor', da_sub.placa_agresor
+            )), '[]') AS CHAR)
+             FROM detalle_agresores_ocurrencia da_sub WHERE da_sub.id_ocurrencia = o.id_ocurrencia
+            ) AS agresores_json
 
         FROM ocurrencia_registro o
         LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
@@ -8153,106 +7877,70 @@ app.get("/ocurrencias/listar/exportarango", async (req, res) => {
         LEFT JOIN via v ON l.id_via = v.id_via
         LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
         LEFT JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
-        INNER JOIN origen ori ON o.id_origen = ori.id_origen 
+        LEFT JOIN origen ori ON o.id_origen = ori.id_origen 
         LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-        LEFT JOIN ocurrencia_vehiculo_detalle ovd ON ovd.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
-        LEFT JOIN tipo_vehiculo tvh ON ovd.id_tipo_vehiculo = tvh.id_tipo_vehiculo
-        LEFT JOIN cat_pnp pnp ON ovd.id_pnp = pnp.id_pnp
+        LEFT JOIN cat_especifica cesp ON m.especifica_id = cesp.id
+        LEFT JOIN cat_generica cgen ON cesp.generica_id = cgen.id
         LEFT JOIN tipo_patrullaje tp ON o.id_tipop = tp.id_tipop
         LEFT JOIN modalidad_patrullaje mp ON o.id_modalidadp = mp.id_modalidadp
         LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
-        LEFT JOIN cat_modalidad cmod ON o.id_modalidad = cmod.id
-        LEFT JOIN cat_especifica cesp ON cmod.especifica_id = cesp.id
-        LEFT JOIN cat_generica cgen ON cesp.generica_id = cgen.id
         LEFT JOIN sipcop_resultado SR ON SR.id_resultado = o.id_resultado_real
         LEFT JOIN sipcop_medio SM ON SM.id_medio = o.id_medio_real
         LEFT JOIN sipcop_lugar SL ON SL.id_lugarsip = o.id_lugar_real
         LEFT JOIN sipcop_consecuencia SC ON SC.id_consecuencia = o.id_consecuencia_real
-
-        LEFT JOIN pnp_agg ON pnp_agg.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN vic_grouped v_grp ON v_grp.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN agr_grouped a_grp ON a_grp.id_ocurrencia = o.id_ocurrencia
-        LEFT JOIN foto_agg foto_agg ON foto_agg.id_ocurrencia = o.id_ocurrencia
-
-        -- 🛑 FILTRO DE FECHAS PARA PROTEGER LA BASE DE DATOS
-        WHERE o.fecha_evento BETWEEN ? AND ?
-
-        GROUP BY o.id_ocurrencia, o.fecha_reporte, o.estado, o.patrimonio_real, o.arresto_ciudadano, 
-                 o.distancia_metros, o.codigo_seguimiento, o.fecha_evento, o.hora_alerta, 
-                 o.hora_llegada, o.hora_repliegue, o.descripcion, o.unidad_encargada, o.referencia,
-                 o.latitud_gps, o.longitud_gps, o.turnr, o.id_resultado_real, o.id_medio_real, 
-                 o.id_lugar_real, o.id_consecuencia_real, o.id_origen, o.id_modalidad, o.id_tipop, o.id_modalidadp,
-                 o.estado_involucrados, pnp_agg.pnp_datos, v_grp.victimas_nombres, v_grp.victimas_edades, 
-                 v_grp.victimas_placas, v_grp.victimas_relacion, a_grp.agresores_nombres, a_grp.agresores_edades, 
-                 a_grp.agresores_placas, foto_agg.total_fotos, foto_agg.foto_principal, foto_agg.foto_1, 
-                 foto_agg.foto_2, foto_agg.foto_3, foto_agg.foto_4
-        ORDER BY o.fecha_reporte DESC
+        LEFT JOIN ocurrencia_vehiculo_detalle ovd ON ovd.id_ocurrencia = o.id_ocurrencia
+        LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
+        LEFT JOIN tipo_vehiculo tvh ON ovd.id_tipo_vehiculo = tvh.id_tipo_vehiculo
+        ${whereClause}
+        ORDER BY o.fecha_reporte DESC 
+        LIMIT ? OFFSET ?
     `;
 
-    // 3. Pasamos las variables de inicio y fin protegidas contra inyección SQL
-    const [rows] = await connection.query(sql, [inicio, fin]);
+    const queryParams = [...paramsWhere, limit, offset];
+    const [rows] = await connection.query(sql, queryParams);
 
-    const respuesta = rows.map((item) => {
-      let listaFotosUrls = [];
-      let listaVictimas = [];
-      let listaAgresores = [];
+    const datosMapeados = rows.map((item) => {
+      let fotos = [];
+      let victimas = [];
+      let agresores = [];
+      try { fotos = JSON.parse(item.fotos_json || "[]"); } catch(e){}
+      try { victimas = JSON.parse(item.victimas_json || "[]"); } catch(e){}
+      try { agresores = JSON.parse(item.agresores_json || "[]"); } catch(e){}
 
-      try {
-        listaFotosUrls = item.fotos_json ? JSON.parse(item.fotos_json) : [];
-      } catch (e) {
-        listaFotosUrls = [];
-      }
-
-      try {
-        listaVictimas = item.victimas_json
-          ? JSON.parse(item.victimas_json)
-          : [];
-      } catch (e) {
-        listaVictimas = [];
-      }
-
-      try {
-        listaAgresores = item.agresores_json
-          ? JSON.parse(item.agresores_json)
-          : [];
-      } catch (e) {
-        listaAgresores = [];
-      }
-
-      const primeraVictima = listaVictimas.length > 0 ? listaVictimas[0] : {};
-      const primerAgresor = listaAgresores.length > 0 ? listaAgresores[0] : {};
+      const primeraVictima = victimas.length > 0 ? victimas[0] : {};
+      const primerAgresor = agresores.length > 0 ? agresores[0] : {};
 
       return {
         ...item,
-        victimas: listaVictimas,
-        agresores: listaAgresores,
-        nombre_victima: primeraVictima.nombre_victima || null,
-        edad_victima: primeraVictima.edad || null,
+        fotos,
+        victimas,
+        agresores,
+        nombre_victima: primeraVictima.nombre_victima || "",
+        edad_victima: primeraVictima.edad || "",
         relacion_victima: primeraVictima.id_relacion_v || null,
-
-        nombre_agresor: primerAgresor.nombre_agresor || null,
-        edad_agresor: primerAgresor.edad || null,
-        placa_agresor: primerAgresor.placa_agresor || null,
-
-        identificado:
-          listaVictimas.length > 0 || listaAgresores.length > 0
-            ? "IDENTIFICADO"
-            : "NO_IDENTIFICADO",
+        nombre_agresor: primerAgresor.nombre_agresor || "",
+        edad_agresor: primerAgresor.edad || "",
+        placa_agresor: primerAgresor.placa_agresor || "",
         pnp_completo: item.pnp_nombre_completo || "No asignado",
-        fecha_evento: item.fecha_evento
-          ? new Date(item.fecha_evento).toISOString().split("T")[0]
-          : "S/F",
-        tiene_fotos: (item.total_fotos || 0) > 0,
-        fotos: listaFotosUrls,
-        lista_fotos: listaFotosUrls,
+        tiene_fotos: fotos.length > 0,
       };
     });
 
-    res.json(respuesta);
+    const esRangoFechasPersonalizado = tieneFiltroReporte || tieneFiltroEvento;
+
+    res.json({
+      success: true,
+      total: totalRegistros,
+      conteosPorEstado: conteosPorEstado,
+      es12Horas: !esRangoFechasPersonalizado,
+      paginaActual: page,
+      registrosPorPagina: limit,
+      data: datosMapeados,
+    });
+
   } catch (error) {
-    console.error("ERROR EN /ocurrencias/listar/exportarformato:", error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error("ERROR EN LISTAR AVANZADO:", error);
+    res.status(500).json({ success: false, total: 0, data: [] });
   } finally {
     if (connection) connection.release();
   }
