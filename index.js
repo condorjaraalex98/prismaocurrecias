@@ -10827,40 +10827,83 @@ app.get("/ocurrencias/catalogos-filtros", async (req, res) => {
   }
 });
 const getFiltroDinamico = (req) => {
-  const { id_origen, id_tipop, id_tipo_vehiculo } = req.query;
+  const { id_origen, id_tipop, id_tipo_vehiculo, excluir_origenes, excluir_tipo_vehiculo } = req.query;
 
   let filtro = "";
   let params = [];
 
-  filtro = `
-    WHERE (
-      -- Turno Mañana (hoy)
-      (CURRENT_TIME() >= '07:00:00' AND CURRENT_TIME() < '15:00:00' AND o.fechar = CURDATE() AND o.turnr = 'm')
-      OR
-      -- Turno Tarde (hoy)
-      (CURRENT_TIME() >= '15:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 't')
-      OR
-      -- Turno Noche parte inicial (hoy a partir de las 22:00)
-      (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'n')
-      OR
-      -- Turno Noche parte madrugada (de 00:00 a 07:00, donde tu trigger restó un día)
-      (CURRENT_TIME() < '07:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'n')
-    )
-    AND TIMESTAMP(o.fechar, o.hora_repliegue) <= NOW()
-  `;
+  // 📌 1. VALIDAR SI ES EL HORARIO ESPECIAL DE MOTOCICLETAS (id_tipo_vehiculo = 2)
+const esMotos = String(id_tipo_vehiculo) === '2';
 
+  if (esMotos) {
+    // Horario actualizado para Motos: Mañana (06-14), Tarde (14-22), Noche (22-06)
+    filtro = `
+      WHERE (
+        -- 📌 Turno Mañana Motos (06:00:00 a 14:00:00 de hoy)
+        (CURRENT_TIME() >= '06:00:00' AND CURRENT_TIME() < '14:00:00' AND o.fechar = CURDATE() AND o.turnr = 'm')
+        OR
+        -- Turno Tarde Motos (14:00:00 a 22:00:00 de hoy)
+        (CURRENT_TIME() >= '14:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 't')
+        OR
+        -- Turno Noche Motos parte inicial (22:00:00 a 23:59:59 de hoy)
+        (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'n')
+        OR
+        -- Turno Noche Motos parte madrugada (00:00:00 a 06:00:00, día anterior)
+        (CURRENT_TIME() < '06:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'n')
+      )
+      AND CONCAT(o.fecha_evento, ' ', o.hora_repliegue) <= NOW()
+    `;
+  }else {
+    // 📌 2. TURNO NORMAL
+    filtro = `
+      WHERE (
+        (CURRENT_TIME() >= '07:00:00' AND CURRENT_TIME() < '15:00:00' AND o.fechar = CURDATE() AND o.turnr = 'm')
+        OR
+        (CURRENT_TIME() >= '15:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 't')
+        OR
+        (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'n')
+        OR
+        (CURRENT_TIME() < '07:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'n')
+      )
+      AND CONCAT(o.fecha_evento, ' ', o.hora_repliegue) <= NOW()
+    `;
+  }
+
+  // Filtro opcional de origen
   if (id_origen && id_origen !== 'TODOS') {
     filtro += ` AND o.id_origen = ? `;
     params.push(id_origen);
   }
+
+  // Excluir orígenes (ej. RCECOM)
+  if (excluir_origenes) {
+    const idsExcluir = excluir_origenes.split(',').map(id => Number(id.trim())).filter(Boolean);
+    if (idsExcluir.length > 0) {
+      filtro += ` AND o.id_origen NOT IN (${idsExcluir.map(() => '?').join(',')}) `;
+      params.push(...idsExcluir);
+    }
+  }
+
+  // Filtro de tipo de patrullaje
   if (id_tipop && id_tipop !== 'TODOS') {
     filtro += ` AND o.id_tipop = ? `;
     params.push(id_tipop);
   }
-  // 📌 AQUÍ ESTABA FALTANDO EL FILTRO POR TIPO DE VEHÍCULO
+
+  // Filtro de tipo de vehículo específico
   if (id_tipo_vehiculo && id_tipo_vehiculo !== 'TODOS') {
     filtro += ` AND ov_filtro.id_tipo_vehiculo = ? `;
     params.push(id_tipo_vehiculo);
+  }
+
+  // 📌 NUEVO: Excluir un tipo de vehículo específico (para que el campo general ignore las motos)
+  if (excluir_tipo_vehiculo) {
+    const tiposExcluir = excluir_tipo_vehiculo.split(',').map(id => Number(id.trim())).filter(Boolean);
+    if (tiposExcluir.length > 0) {
+      // Usamos LEFT JOIN, por lo que evaluamos que NO sea el vehículo excluido O que no tenga vehículo registrado
+      filtro += ` AND (ov_filtro.id_tipo_vehiculo NOT IN (${tiposExcluir.map(() => '?').join(',')}) OR ov_filtro.id_tipo_vehiculo IS NULL) `;
+      params.push(...tiposExcluir);
+    }
   }
 
   return { filtro, params };
