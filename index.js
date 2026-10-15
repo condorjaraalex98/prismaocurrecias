@@ -4760,7 +4760,7 @@ app.post("/ocurrencias/registrar/veh", async (req, res) => {
 app.get("/catalogos/pnp-activos", async (req, res) => {
   try {
     const [rows] = await db.query(
-      "SELECT id_pnp as value, CONCAT(grado, ' ', nombres, ' ', apellidos) as label FROM cat_pnp WHERE estado = 1",
+      "SELECT id_pnp as value, CONCAT(apellidos, ', ', nombres) as label FROM cat_pnp WHERE estado = 1",
     );
     res.json(rows);
   } catch (error) {
@@ -6812,7 +6812,8 @@ app.get("/ocurrencias/listar/tablasipcop-rango", async (req, res) => {
       whereClause = `WHERE o.fecha_reporte BETWEEN ? AND ?`;
       paramsWhere.push(fecha_inicio, fecha_fin);
     } else {
-      whereClause = `WHERE o.fecha_reporte >= NOW() - INTERVAL 7 DAY`;
+      whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
+   
     }
 
     // 3. Conteo total exacto de ocurrencias
@@ -6977,7 +6978,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hrol", async (req, res) => {
       whereConditions.push(`o.fecha_reporte BETWEEN ? AND ?`);
       paramsWhere.push(fecha_inicio, fecha_fin);
     } else {
-      whereConditions.push(`o.fecha_reporte >= NOW() - INTERVAL 12 HOUR`);
+    whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
     }
 
    // Si el frontend envía el id_usuario, filtramos estrictamente los registros de ese usuario
@@ -7186,7 +7187,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango12h", async (req, res) => {
       whereConditions.push(`o.fecha_reporte BETWEEN ? AND ?`);
       paramsWhere.push(fecha_inicio, fecha_fin);
     } else {
-      whereConditions.push(`o.fecha_reporte >= NOW() - INTERVAL 12 HOUR`);
+    whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
     }
 
    // Si el frontend envía el id_usuario, filtramos estrictamente los registros de ese usuario
