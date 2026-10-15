@@ -108,22 +108,41 @@ app.post("/ocurrencias/subir-foto-adjunta", upload.single("foto"), async (req, r
       return res.status(400).json({ success: false, message: "No se envió ninguna foto." });
     }
 
-    // 1. Optimización rápida con Sharp + Autorotación EXIF para celulares
+    // 📌 RECIBIMOS LOS DATOS DESDE EL FORMDATA DE LA APP
+    const { id_modalidad, fecha_evento } = req.body;
+    
+    // Si id_modalidad llega vacío o undefined, imprimimos una alerta en consola para depurar
+    console.log("📥 Recibiendo subida individual - ID Modalidad:", id_modalidad);
+
     const bufferOptimizado = await sharp(req.file.buffer)
-      .rotate() // Corrige la orientación de fotos tomadas verticalmente desde smartphones
+      .rotate()
       .resize({ width: 1200, withoutEnlargement: true })
       .jpeg({ quality: 75 })
       .toBuffer();
 
-    // 2. Definición del nombre único con hash aleatorio anti-colisión
+    let anio = "2026";
+    let mes = "10";
+    let dia = "15";
+
+    if (fecha_evento && /^\d{4}-\d{2}-\d{2}$/.test(fecha_evento)) {
+      const partes = fecha_evento.split("-");
+      anio = partes[0];
+      mes = partes[1];
+      dia = partes[2];
+    } else {
+      const fechaActual = new Date();
+      anio = fechaActual.getFullYear();
+      mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
+      dia = String(fechaActual.getDate()).padStart(2, "0");
+    }
+
     const timestamp = Date.now();
     const randomId = crypto.randomBytes(4).toString("hex");
-    const fechaActual = new Date();
-    const anio = fechaActual.getFullYear();
-    const mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
-    const nombreArchivo = `ocurrencias/${anio}/${mes}/foto_${timestamp}_${randomId}.jpg`;
 
-    // 3. Subida directa a Cloudflare R2
+    // Si id_modalidad viene nulo, usaremos un texto de respaldo pero sabremos que faltaba enviarlo
+    const carpetaModalidad = id_modalidad || "sin_modalidad";
+    const nombreArchivo = `ocurrencias/modalidad_${carpetaModalidad}/${anio}/${mes}/${dia}/foto_${timestamp}_${randomId}.jpg`;
+
     await r2Client.send(
       new PutObjectCommand({
         Bucket: BUCKET_NAME,
@@ -135,7 +154,6 @@ app.post("/ocurrencias/subir-foto-adjunta", upload.single("foto"), async (req, r
 
     const urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
 
-    // 4. Retorno de la URL pública de la imagen subida
     return res.json({
       success: true,
       url_imagen: urlImagen,
@@ -150,10 +168,10 @@ app.post("/ocurrencias/subir-foto-adjunta", upload.single("foto"), async (req, r
 // ==========================================
 // FUNCIÓN EN SEGUNDO PLANO (Sharp + R2)
 // ==========================================
-async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
+async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool, id_modalidad, fecha_evento) {
   console.log(`\n==================================================`);
   console.log(`⏳ INICIANDO PROCESO EN SEGUNDO PLANO`);
-  console.log(`📌 Ocurrencia ID: #${id_ocurrencia}`);
+  console.log(`📌 Ocurrencia ID: #${id_ocurrencia} | Modalidad: #${id_modalidad} | Fecha: ${fecha_evento}`);
   console.log(`📸 Cantidad de fotos recibidas: ${fotos ? fotos.length : 0}`);
   console.log(`==================================================`);
 
@@ -193,12 +211,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
           continue;
         }
 
-        // 🛡️ APLICAMOS LA LIMPIEZA ESTRICTA AQUÍ
-        const urlLimpia = limpiarUrlR2(base64Data);
-
-        // Si ya es una URL web existente limpia, la registramos directo en BD sin re-subir
-       // Si es una URL web existente, la limpiamos y registramos directo en BD
-// Si ya es una URL web existente (ej. viene de una edición previa o de otro lado)
+        // Si ya es una URL web existente, la limpiamos y registramos directo en BD
         if (typeof base64Data === "string" && (base64Data.includes("r2.dev") || base64Data.startsWith("http"))) {
           const urlLimpiaParaBD = limpiarUrlR2(base64Data);
           console.log(`🌐 URL limpia asegurada para BD: ${urlLimpiaParaBD}`);
@@ -207,12 +220,11 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
             ? urlLimpiaParaBD.replace(`${PUBLIC_DOMAIN}/`, "")
             : null;
 
-          // 🛑 AQUÍ ESTABLECEMOS EXPLÍCITAMENTE LOS 3 VALORES
           await dbPool.query(
             "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
             [id_ocurrencia, urlLimpiaParaBD, publicIdExistente],
           );
-          continue; // Salta al siguiente elemento del bucle
+          continue;
         }
 
         // Limpiar y convertir Base64 a Buffer
@@ -235,14 +247,26 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
 
       const timestamp = Date.now();
       const randomId = crypto.randomBytes(4).toString("hex");
-      const fechaActual = new Date();
-      const anio = fechaActual.getFullYear();
-      const mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
 
-      const nombreArchivo = `ocurrencias/${anio}/${mes}/${id_ocurrencia}_${idx}_${timestamp}_${randomId}.jpg`;
+      // 📅 EXTRACCIÓN DE AÑO, MES Y DÍA BASADO EN LA FECHA DEL EVENTO (YYYY-MM-DD)
+      let anio = "2026";
+      let mes = "10";
+      let dia = "15";
+
+      if (fecha_evento && /^\d{4}-\d{2}-\d{2}$/.test(fecha_evento)) {
+        const partes = fecha_evento.split("-");
+        anio = partes[0];
+        mes = partes[1];
+        dia = partes[2];
+      }
+
+      // 📂 CARPETA ORGANIZADA POR MODALIDAD Y FECHA EXACTA (AÑO / MES / DÍA)
+      const carpetaModalidad = id_modalidad || "sin_modalidad";
+      const nombreArchivo = `ocurrencias/modalidad_${carpetaModalidad}/${anio}/${mes}/${dia}/${id_ocurrencia}_${idx}_${timestamp}_${randomId}.jpg`;
+
+      console.log(`📁 RUTA GENERADA PARA R2: ${nombreArchivo}`);
 
       // 4. SUBIR A CLOUDFLARE R2
-      console.log(`🚀 Subiendo foto [${idx}] a Cloudflare R2 (${nombreArchivo})...`);
       await r2Client.send(
         new PutObjectCommand({
           Bucket: BUCKET_NAME,
@@ -253,10 +277,8 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
       );
 
       const urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
-      console.log(`🌐 URL Generada: ${urlImagen}`);
 
-      // 5. GUARDAR URL LIMPIA EN MYSQL
-      console.log(`💾 Guardando URL y public_id en base de datos MySQL...`);
+      // 5. GUARDAR EN MYSQL
       await dbPool.query(
         "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
         [id_ocurrencia, urlImagen, nombreArchivo],
@@ -268,7 +290,6 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool) {
     }
   }
 }
-
 // ==========================================
 // 📝 ENDPOINT DE REGISTRO DE OCURRENCIA
 // ==========================================
@@ -456,15 +477,16 @@ app.post("/ocurrencias/registrar/modr2x", async (req, res) => {
     // =========================================================
     // PROCESAR Y SUBIR FOTOS EN SEGUNDO PLANO
     // =========================================================
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(
-        (err) => {
-          console.error(
-            "🔴 Error crítico general en segundo plano de fotos:",
-            err.message,
-          );
-        },
-      );
+   if (fotos && Array.isArray(fotos) && fotos.length > 0) {
+      procesarYSubirFotosSegundoPlano(
+        id_nueva_ocurrencia, 
+        fotos, 
+        db, 
+        id_modalidad,     // 👈 Usamos el ID de la modalidad
+        fecha_evento      // 👈 Usamos la fecha exacta seleccionada en el formulario
+      ).catch((err) => {
+        console.error("🔴 Error crítico general en segundo plano de fotos:", err.message);
+      });
     }
   } catch (error) {
     if (connection) await connection.rollback();
@@ -894,7 +916,7 @@ const fechaActual = new Date();
     // PROCESAR Y SUBIR FOTOS EN SEGUNDO PLANO
     // =========================================================
     if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(
+      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db, id_modalidad).catch(
         (err) => {
           console.error(
             "🔴 Error crítico general en segundo plano de fotos:",
