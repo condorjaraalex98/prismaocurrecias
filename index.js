@@ -10860,25 +10860,25 @@ const getFiltroDinamico = (req) => {
   if (esMotos) {
     filtro = `
       WHERE (
-        (CURRENT_TIME() >= '06:00:00' AND CURRENT_TIME() < '14:00:00' AND o.fechar = CURDATE() AND o.turnr = 'm')
+        (CURRENT_TIME() >= '06:00:00' AND CURRENT_TIME() < '14:00:00' AND o.fecharm = CURDATE() AND o.turnrm = 'M')
         OR
-        (CURRENT_TIME() >= '14:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 't')
+        (CURRENT_TIME() >= '14:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fecharm = CURDATE() AND o.turnrm = 'T')
         OR
-        (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'n')
+        (CURRENT_TIME() >= '22:00:00' AND o.fecharm = CURDATE() AND o.turnrm = 'N')
         OR
-        (CURRENT_TIME() < '06:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'n')
+        (CURRENT_TIME() < '06:00:00' AND o.fecharm = CURDATE() - INTERVAL 1 DAY AND o.turnrm = 'N')
       )
     `; // 👈 ELIMINAMOS EL "AND CONCAT(...) <= NOW()" AQUí
   } else {
     filtro = `
       WHERE (
-        (CURRENT_TIME() >= '07:00:00' AND CURRENT_TIME() < '15:00:00' AND o.fechar = CURDATE() AND o.turnr = 'm')
+        (CURRENT_TIME() >= '07:00:00' AND CURRENT_TIME() < '15:00:00' AND o.fechar = CURDATE() AND o.turnr = 'M')
         OR
-        (CURRENT_TIME() >= '15:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 't')
+        (CURRENT_TIME() >= '15:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'T')
         OR
-        (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'n')
+        (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'N')
         OR
-        (CURRENT_TIME() < '07:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'n')
+        (CURRENT_TIME() < '07:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'N')
       )
     `; // 👈 Y AQUí TAMBIÉN
   }
@@ -10888,8 +10888,7 @@ const getFiltroDinamico = (req) => {
     filtro += ` AND o.id_origen = ? `;
     params.push(id_origen);
   }
-
-  if (excluir_origenes) {
+if (excluir_origenes) {
     const idsExcluir = excluir_origenes.split(',').map(id => Number(id.trim())).filter(Boolean);
     if (idsExcluir.length > 0) {
       filtro += ` AND o.id_origen NOT IN (${idsExcluir.map(() => '?').join(',')}) `;
@@ -10902,15 +10901,17 @@ const getFiltroDinamico = (req) => {
     params.push(id_tipop);
   }
 
+  // 🛠️ Corrección: Usar 'ov_filtro' en lugar de 'ov'
   if (id_tipo_vehiculo && id_tipo_vehiculo !== 'TODOS') {
-    filtro += ` AND ov.id_tipo_vehiculo = ? `;
+    filtro += ` AND ov_filtro.id_tipo_vehiculo = ? `;
     params.push(id_tipo_vehiculo);
   }
 
+  // 🛠️ Corrección: Usar 'ov_filtro' en lugar de 'ov'
   if (excluir_tipo_vehiculo) {
     const tiposExcluir = excluir_tipo_vehiculo.split(',').map(id => Number(id.trim())).filter(Boolean);
     if (tiposExcluir.length > 0) {
-      filtro += ` AND (ov.id_tipo_vehiculo NOT IN (${tiposExcluir.map(() => '?').join(',')}) OR ov.id_tipo_vehiculo IS NULL) `;
+      filtro += ` AND (ov_filtro.id_tipo_vehiculo NOT IN (${tiposExcluir.map(() => '?').join(',')}) OR ov_filtro.id_tipo_vehiculo IS NULL) `;
       params.push(...tiposExcluir);
     }
   }
