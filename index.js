@@ -23,7 +23,7 @@ const db = mysql.createPool({
   port: process.env.DB_PORT || 8889,
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "root",
-  database: process.env.DB_NAME || "restaurado",
+  database: process.env.DB_NAME || "restaurado1",
   connectionLimit: 10,
   waitForConnections: true,
   queueLimit: 0,
@@ -214,7 +214,7 @@ async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool, id_
         // Si ya es una URL web existente, la limpiamos y registramos directo en BD
         if (typeof base64Data === "string" && (base64Data.includes("r2.dev") || base64Data.startsWith("http"))) {
           const urlLimpiaParaBD = limpiarUrlR2(base64Data);
-          console.log(`🌐 URL limpia asegurada para BD: ${urlLimpiaParaBD}`);
+       
 
           const publicIdExistente = urlLimpiaParaBD && urlLimpiaParaBD.includes(PUBLIC_DOMAIN)
             ? urlLimpiaParaBD.replace(`${PUBLIC_DOMAIN}/`, "")
@@ -936,7 +936,217 @@ const fechaActual = new Date();
   }
 });
 
+app.post("/ocurrencias/registrar/modr2para", async (req, res) => {
+  let connection;
+  try {
+    const {
+      id_usuario,
+      id_lugar,
+      id_modalidad,
+      id_origen,
+      id_camara,
+      id_tipop,
+      id_modalidadp,
+      descripcion,
+      hora_alerta,
+      hora_llegada,
+      hora_repliegue,
+      latitud_gps,
+      longitud_gps,
+      nombre_punto_gps,
+      referencia,
+      unidad_encargada,
+      fecha_evento,
+      grupo,
+      turno,
+      fotos,
+      estadoOcurrencia,
+      vehiculos_detalle,
+      id_personal_ids,
+      detalle_llamada,
+      agresores_detalle,
+      victimas_detalle,
+      datos_importantes, // 👈 NUEVO: Recibe el objeto con los checkboxes y pertenece_muni
+    } = req.body;
 
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const fechaActual = new Date();
+    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
+    const fechaPeruObj = new Date(formatoPeru);
+
+    const anio = fechaPeruObj.getFullYear();
+    const mes = String(fechaPeruObj.getMonth() + 1).padStart(2, "0");
+    const dia = String(fechaPeruObj.getDate()).padStart(2, "0");
+    const hora = String(fechaPeruObj.getHours()).padStart(2, "0");
+    const minuto = String(fechaPeruObj.getMinutes()).padStart(2, "0");
+    const segundo = String(fechaPeruObj.getSeconds()).padStart(2, "0");
+
+    const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
+
+    // 1. INSERTAR OCURRENCIA PRINCIPAL
+    const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
+            descripcion, hora_alerta, hora_llegada, hora_repliegue, 
+            id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
+            id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
+            nombre_punto_gps, referencia, unidad_encargada, 
+            fecha_reporte, fecha_evento, estado, grupo, turno
+        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+    const [resOcurrencia] = await connection.query(sqlOcurrencia, [
+      descripcion,
+      hora_alerta || null,
+      hora_llegada || null,
+      hora_repliegue || null,
+      id_lugar,
+      id_usuario,
+      id_modalidad,
+      id_modalidad,
+      id_origen,
+      id_tipop || null,
+      id_modalidadp || null,
+      latitud_gps || 0,
+      longitud_gps || 0,
+      nombre_punto_gps || "",
+      referencia || "",
+      unidad_encargada || "SERENAZGO",
+      fechaReportePeru,
+      fecha_evento,
+      estadoOcurrencia,
+      grupo,
+      turno || null
+    ]);
+
+    const id_nueva_ocurrencia = resOcurrencia.insertId;
+
+    // 1.1. INSERTAR DATOS IMPORTANTES Y PERTENENCIA MUNICIPAL (NUEVO)
+    if (datos_importantes) {
+      await connection.query(
+        `INSERT INTO detalle_datos_importantes_ocurrencia 
+         (id_ocurrencia, por_orden_central, control_fv_sv, inyectable, curacion_topica, traslado_urgencia, pertenece_muni) 
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id_nueva_ocurrencia,
+          datos_importantes.por_orden_central ? 1 : 0,
+          datos_importantes.control_fv_sv ? 1 : 0,
+          datos_importantes.inyectable ? 1 : 0,
+          datos_importantes.curacion_topica ? 1 : 0,
+          datos_importantes.traslado_urgencia ? 1 : 0,
+          datos_importantes.pertenece_muni ? 1 : 0,
+        ]
+      );
+    }
+
+    // 2. INSERTAR DETALLE DE CÁMARAS
+    if (id_camara) {
+      let idsCam = Array.isArray(id_camara)
+        ? id_camara
+        : typeof id_camara === "string"
+          ? id_camara.split(",")
+          : [];
+      const idsCamLimpios = idsCam.map((id) => parseInt(id)).filter((id) => !isNaN(id));
+      if (idsCamLimpios.length > 0) {
+        const valuesCamara = idsCamLimpios.map((camId) => [id_nueva_ocurrencia, camId]);
+        await connection.query(
+          "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
+          [valuesCamara]
+        );
+      }
+    }
+
+    // 3. INSERTAR PERSONAL DE APOYO
+    if (id_personal_ids) {
+      let idsPers = Array.isArray(id_personal_ids)
+        ? id_personal_ids
+        : typeof id_personal_ids === "string"
+          ? id_personal_ids.split(",")
+          : [];
+      const idsPersLimpios = idsPers.map((id) => parseInt(id)).filter((id) => !isNaN(id));
+      if (idsPersLimpios.length > 0) {
+        const valuesPersonal = idsPersLimpios.map((persId) => [id_nueva_ocurrencia, persId]);
+        await connection.query(
+          "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
+          [valuesPersonal]
+        );
+      }
+    }
+
+    // 4. INSERTAR VEHÍCULOS
+    if (vehiculos_detalle && vehiculos_detalle.length > 0) {
+      const valuesV = vehiculos_detalle.map((v) => [
+        id_nueva_ocurrencia,
+        v.id_tipo_vehiculo,
+        v.id_unidad,
+        v.tipo_asignacion,
+        v.id_pnp,
+      ]);
+      await connection.query(
+        `INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?`,
+        [valuesV]
+      );
+    }
+
+    // 5. INSERTAR DETALLE DE LLAMADA
+    if (detalle_llamada && detalle_llamada.numero_telefono) {
+      await connection.query(
+        "INSERT INTO detalle_llamada_ocurrencia (id_ocurrencia, numero_telefono, nombre_informante) VALUES (?, ?, ?)",
+        [
+          id_nueva_ocurrencia,
+          detalle_llamada.numero_telefono,
+          detalle_llamada.nombre_informante || "Sin dato",
+        ]
+      );
+    }
+
+    // 6. INSERTAR AGRESORES
+    if (agresores_detalle && Array.isArray(agresores_detalle) && agresores_detalle.length > 0) {
+      const valuesAgresores = agresores_detalle.map((a) => [
+        id_nueva_ocurrencia,
+        a.nombre_agresor || "N.N.",
+        a.id_tipo_vehiculo || null,
+        a.placa_agresor || null,
+      ]);
+      await connection.query(
+        "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?",
+        [valuesAgresores]
+      );
+    }
+
+    // 7. INSERTAR VÍCTIMAS
+    if (victimas_detalle && Array.isArray(victimas_detalle) && victimas_detalle.length > 0) {
+      const valuesVictimas = victimas_detalle.map((v) => [
+        id_nueva_ocurrencia,
+        v.nombre_victima || "N.N.",
+        v.id_tipo_vehiculo || null,
+        v.placa_victima || null,
+        v.id_relacion_v || null,
+      ]);
+      await connection.query(
+        "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?",
+        [valuesVictimas]
+      );
+    }
+
+    await connection.commit();
+
+    res.status(201).json({ success: true, id: id_nueva_ocurrencia });
+
+    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
+      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db, id_modalidad).catch((err) => {
+        console.error("🔴 Error crítico general en segundo plano de fotos:", err.message);
+      });
+    }
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error("🔴 ERROR:", error.message);
+    if (!res.headersSent) {
+      res.status(400).json({ success: false, error: error.message });
+    }
+  } finally {
+    if (connection) connection.release();
+  }
+});
 
 
 app.post("/ocurrencias/registrar/modr3", async (req, res) => {
@@ -2488,24 +2698,33 @@ app.put("/updatelugar/:id", async (req, res) => {
     const { id } = req.params;
     const { nombre_lugar, id_tipo_lugar, id_via, id_cuadra, latitud, longitud, estado, unidad_encargada } = req.body;
 
-    if (id_tipo_lugar == null || id_via == null || id_cuadra == null) {
+    // 1. Quitamos id_cuadra de los campos estrictamente obligatorios
+    if (id_tipo_lugar == null || id_via == null) {
       return res.status(400).json({
         success: false,
-        message: "Los campos id_tipo_lugar, id_via y id_cuadra son obligatorios",
+        message: "Los campos id_tipo_lugar y id_via son obligatorios",
       });
     }
 
-    const [existente] = await db.query(
-      "SELECT id_lugar FROM lugar WHERE id_via = ? AND id_cuadra = ? AND id_lugar != ?",
-      [id_via, id_cuadra, id]
-    );
+    // 2. Sanitizar id_cuadra: si viene vacío, undefined o null, se convierte en null real
+    const cuadraParam = (id_cuadra === "" || id_cuadra === undefined || id_cuadra === null) 
+      ? null 
+      : Number(id_cuadra);
 
-    if (existente.length > 0) {
-      return res.status(409).json({
-        success: false,
-        code: "LUGAR_DUPLICADO",
-        message: `No se puede actualizar. La Vía ID ${id_via} y Cuadra ID ${id_cuadra} ya pertenecen a otro lugar.`,
-      });
+    // 3. Validar duplicados solo si el usuario seleccionó una cuadra
+    if (cuadraParam !== null) {
+      const [existente] = await db.query(
+        "SELECT id_lugar FROM lugar WHERE id_via = ? AND id_cuadra = ? AND id_lugar != ?",
+        [id_via, cuadraParam, id]
+      );
+
+      if (existente.length > 0) {
+        return res.status(409).json({
+          success: false,
+          code: "LUGAR_DUPLICADO",
+          message: `No se puede actualizar. La Vía ID ${id_via} y Cuadra ID ${cuadraParam} ya pertenecen a otro lugar.`,
+        });
+      }
     }
 
     const lat = parseFloat(latitud) || 0;
@@ -2531,7 +2750,7 @@ app.put("/updatelugar/:id", async (req, res) => {
       nombre_lugar || null,
       Number(id_tipo_lugar),
       Number(id_via),
-      Number(id_cuadra),
+      cuadraParam, // <- Aquí se actualizará como NULL en la base de datos si se eligió la opción opcional
       lat,
       lng,
       point,
@@ -2584,24 +2803,33 @@ app.post("/insertlugar", async (req, res) => {
   try {
     const { nombre_lugar, id_tipo_lugar, id_via, id_cuadra, latitud, longitud, estado = 1, unidad_encargada } = req.body;
 
-    if (id_tipo_lugar == null || id_via == null || id_cuadra == null) {
+    // 1. Validamos solo los campos verdaderamente obligatorios
+    if (id_tipo_lugar == null || id_via == null) {
       return res.status(400).json({
         success: false,
-        message: "Los campos id_tipo_lugar, id_via y id_cuadra son obligatorios",
+        message: "Los campos id_tipo_lugar y id_via son obligatorios",
       });
     }
 
-    const [existente] = await db.query(
-      "SELECT id_lugar FROM lugar WHERE id_via = ? AND id_cuadra = ?",
-      [id_via, id_cuadra]
-    );
+    // 2. AQUÍ ESTÁ LA SOLUCIÓN: Si id_cuadra está vacío, llega como "" o undefined, lo convertimos en null
+    const cuadraParam = (id_cuadra === "" || id_cuadra === undefined || id_cuadra === null) 
+      ? null 
+      : Number(id_cuadra);
 
-    if (existente.length > 0) {
-      return res.status(409).json({
-        success: false,
-        code: "LUGAR_DUPLICADO",
-        message: `El lugar con la Vía ID ${id_via} y Cuadra ID ${id_cuadra} ya se encuentra registrado.`,
-      });
+    // 3. Validar duplicados solo si el usuario seleccionó una cuadra
+    if (cuadraParam !== null) {
+      const [existente] = await db.query(
+        "SELECT id_lugar FROM lugar WHERE id_via = ? AND id_cuadra = ?",
+        [id_via, cuadraParam]
+      );
+
+      if (existente.length > 0) {
+        return res.status(409).json({
+          success: false,
+          code: "LUGAR_DUPLICADO",
+          message: `El lugar con la Vía ID ${id_via} y Cuadra ID ${cuadraParam} ya se encuentra registrado.`,
+        });
+      }
     }
 
     const lat = parseFloat(latitud) || 0;
@@ -2615,10 +2843,10 @@ app.post("/insertlugar", async (req, res) => {
     `;
 
     const [result] = await db.query(sql, [
-      nombre_lugar || null,
+      nombre_lugar ? String(nombre_lugar).trim() : null,
       Number(id_tipo_lugar),
       Number(id_via),
-      Number(id_cuadra),
+      cuadraParam, // <- Aquí enviará NULL a la base de datos si se seleccionó la opción opcional
       lat,
       lng,
       point,
@@ -2640,9 +2868,223 @@ app.post("/insertlugar", async (req, res) => {
     });
   }
 });
+// ==========================================
+// 5. INSERTAR VIA
 
-// GET /edit contraseñas
-// Endpoint administrativo: No requiere la clave anterior
+// Catálogos para los Pickers (Distritos y Tipos de Vía)
+app.get("/lugar-vias", async (req, res) => {
+  try {
+    const [tiposVia] = await db.query("SELECT id_tipo_via, abreviatura, descripcion FROM tipo_via");
+    const [distritos] = await db.query("SELECT id_distrito, nombre_distrito FROM distrito WHERE estado = 1");
+
+    res.json({
+      success: true,
+      tiposVia,
+      distritos,
+    });
+  } catch (err) {
+    console.error("❌ Error al obtener catálogos:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Listado total con Paginación, Filtros y JOINs correctos
+app.get("/viastotal", async (req, res) => {
+  try {
+    const { q = "", tipo_via = "TODOS", estado = "TODOS", page = 1, export: isExport } = req.query;
+    const limit = 20;
+    const offset = (parseInt(page) - 1) * limit;
+
+    let whereClauses = [];
+    let queryParams = [];
+
+    if (q.trim() !== "") {
+      whereClauses.push("v.nombre_via LIKE ?");
+      queryParams.push(`%${q.trim()}%`);
+    }
+
+    if (tipo_via !== "TODOS") {
+      whereClauses.push("v.id_tipo_via = ?");
+      queryParams.push(Number(tipo_via));
+    }
+
+    if (estado !== "TODOS") {
+      whereClauses.push("v.estado = ?");
+      queryParams.push(Number(estado));
+    }
+
+    const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+
+    const [countsResult] = await db.query(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN estado = 1 THEN 1 ELSE 0 END) as activos,
+        SUM(CASE WHEN estado = 0 THEN 1 ELSE 0 END) as inactivos
+      FROM via
+    `);
+
+    const dataQuery = `
+      SELECT 
+        v.*, 
+        tv.abreviatura, 
+        tv.descripcion AS nombre_tipo_via, 
+        d.nombre_distrito 
+      FROM via v
+      LEFT JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
+      LEFT JOIN distrito d ON v.id_distrito = d.id_distrito
+      ${whereString}
+      ORDER BY v.id_via DESC
+      ${isExport === "true" ? "" : "LIMIT ? OFFSET ?"}
+    `;
+
+    const finalParams = isExport === "true" ? queryParams : [...queryParams, limit, offset];
+    const [rows] = await db.query(dataQuery, finalParams);
+
+    res.json({
+      success: true,
+      counts: countsResult[0] || { total: 0, activos: 0, inactivos: 0 },
+      data: rows,
+      pagination: {
+        hasMore: rows.length === limit,
+        page: parseInt(page),
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Error al listar /viastotal:", err);
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      error: err.message,
+    });
+  }
+});
+
+// Insertar Vía
+app.post("/insertvia", async (req, res) => {
+  try {
+    const { id_distrito, estado = 1, nombre_via, id_tipo_via } = req.body;
+
+    if (!nombre_via || id_tipo_via == null || id_distrito == null) {
+      return res.status(400).json({
+        success: false,
+        message: "Distrito, Nombre de vía y Tipo de vía son obligatorios",
+      });
+    }
+
+    const nombreViaClean = String(nombre_via).toUpperCase().trim();
+    const tipoViaParam = Number(id_tipo_via);
+    const distritoParam = Number(id_distrito);
+
+    const [existente] = await db.query(
+      "SELECT id_via FROM via WHERE UPPER(TRIM(nombre_via)) = ? AND id_tipo_via = ? AND id_distrito = ?",
+      [nombreViaClean, tipoViaParam, distritoParam]
+    );
+
+    if (existente.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: "VIA_DUPLICADA",
+        message: `La vía "${nombreViaClean}" ya se encuentra registrada para este tipo en el distrito seleccionado.`,
+      });
+    }
+
+    const sql = `
+      INSERT INTO via (id_distrito, estado, nombre_via, id_tipo_via) 
+      VALUES (?, ?, ?, ?)
+    `;
+
+    const [result] = await db.query(sql, [
+      distritoParam,
+      Number(estado),
+      nombreViaClean,
+      tipoViaParam,
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: "Vía registrada correctamente",
+      id: result.insertId,
+    });
+  } catch (err) {
+    console.error("❌ Error al insertar en via:", err);
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      error: err.message,
+    });
+  }
+});
+
+// Actualizar Vía
+app.put("/updatevia/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { id_distrito, estado, nombre_via, id_tipo_via } = req.body;
+
+    if (!nombre_via || id_tipo_via == null || id_distrito == null) {
+      return res.status(400).json({
+        success: false,
+        message: "Distrito, Nombre de vía y Tipo de vía son obligatorios",
+      });
+    }
+
+    const nombreViaClean = String(nombre_via).toUpperCase().trim();
+    const tipoViaParam = Number(id_tipo_via);
+    const distritoParam = Number(id_distrito);
+
+    const [existente] = await db.query(
+      "SELECT id_via FROM via WHERE UPPER(TRIM(nombre_via)) = ? AND id_tipo_via = ? AND id_distrito = ? AND id_via != ?",
+      [nombreViaClean, tipoViaParam, distritoParam, id]
+    );
+
+    if (existente.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: "VIA_DUPLICADA",
+        message: `No se puede actualizar. La vía "${nombreViaClean}" ya pertenece a otro registro en este distrito.`,
+      });
+    }
+
+    const sql = `
+      UPDATE via 
+      SET 
+        id_distrito = ?,
+        estado = ?, 
+        nombre_via = ?, 
+        id_tipo_via = ?
+      WHERE id_via = ?
+    `;
+
+    const [result] = await db.query(sql, [
+      distritoParam,
+      estado !== undefined ? Number(estado) : 1,
+      nombreViaClean,
+      tipoViaParam,
+      id,
+    ]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No se encontró ninguna vía registrada con el ID proporcionado",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Vía actualizada correctamente",
+    });
+  } catch (err) {
+    console.error("❌ Error al actualizar via:", err);
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      error: err.message,
+    });
+  }
+});
+
 app.put("/admin/reset-passwordseg/:id_persona", async (req, res) => {
   try {
     const { id_persona } = req.params;
@@ -6834,7 +7276,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango", async (req, res) => {
       whereClause = `WHERE o.fecha_reporte BETWEEN ? AND ?`;
       paramsWhere.push(fecha_inicio, fecha_fin);
     } else {
-      whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
+      whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
    
     }
 
@@ -7000,7 +7442,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango12hrol", async (req, res) => {
       whereConditions.push(`o.fecha_reporte BETWEEN ? AND ?`);
       paramsWhere.push(fecha_inicio, fecha_fin);
     } else {
-    whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
+    whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
     }
 
    // Si el frontend envía el id_usuario, filtramos estrictamente los registros de ese usuario
@@ -7209,7 +7651,7 @@ app.get("/ocurrencias/listar/tablasipcop-rango12h", async (req, res) => {
       whereConditions.push(`o.fecha_reporte BETWEEN ? AND ?`);
       paramsWhere.push(fecha_inicio, fecha_fin);
     } else {
-    whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(NOW(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
+    whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
     }
 
    // Si el frontend envía el id_usuario, filtramos estrictamente los registros de ese usuario
@@ -11089,9 +11531,17 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
     const mes = req.query.mes || new Date().getMonth() + 1;
     const anio = req.query.anio || new Date().getFullYear();
     const idModalidad = req.query.id_modalidad;
+    const idOrigen = req.query.id_origen;
+    const modo = req.query.modo || "turnos";
+    const busqueda = req.query.busqueda || "";
+    
+    const limit = parseInt(req.query.limit) || 10;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
 
-    // Filtros basados en 'fechar' (Ajustado exactamente con la lógica del trigger)
-    let whereClause = `WHERE MONTH(o.fechar) = ? AND YEAR(o.fechar) = ?`;
+    const campoFecha = modo === "normal" ? "o.fecha_evento" : "o.fechar";
+
+    let whereClause = `WHERE MONTH(${campoFecha}) = ? AND YEAR(${campoFecha}) = ?`;
     let queryParams = [mes, anio];
 
     if (idModalidad) {
@@ -11099,61 +11549,125 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
       queryParams.push(idModalidad);
     }
 
-    // 1. Evolución diaria desglosada por turno usando 'fechar'
+    if (idOrigen) {
+      whereClause += ` AND o.id_origen = ?`;
+      queryParams.push(idOrigen);
+    }
+
+    // Filtro dinámico por nombre o apellidos del personal
+    let searchClause = "";
+    let searchParams = [];
+    if (busqueda.trim() !== "") {
+      searchClause = ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) LIKE ?)`;
+      const termino = `%${busqueda.trim()}%`;
+      searchParams = [termino, termino, termino, termino];
+    }
+
+    // 1. Evolución diaria
     const sqlDiarioTurnos = `
       SELECT 
-        DAY(o.fechar) AS dia,
-        o.turnrm AS turno,
+        DAY(${campoFecha}) AS dia,
+        o.turnr AS turno,
         COUNT(o.id_ocurrencia) AS total
       FROM ocurrencia_registro o
-      ${whereClause} AND o.turnrm IN ('M', 'T', 'N')
-      GROUP BY DAY(o.fechar), o.turnrm
-      ORDER BY dia ASC;
-    `;
-
-    // 2. Matriz de usuarios agrupada por fechar, turno y modalidad (Incluyendo JOIN con cat_modalidad)
-    const sqlMatrizUsuarios = `
-      SELECT 
-        COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
-        DAY(o.fechar) AS dia,
-        o.turnrm AS turno,
-        o.id_modalidad,
-        COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
-        COUNT(o.id_ocurrencia) AS total
-      FROM ocurrencia_registro o
-      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
+      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
       LEFT JOIN persona p ON us.id_persona = p.id_persona
-      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-      ${whereClause}
-      GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(o.fechar), o.turnrm, o.id_modalidad, m.nombre
-      ORDER BY usuario ASC;
+      ${whereClause} ${searchClause} AND o.turnr IN ('M', 'T', 'N')
+      GROUP BY DAY(${campoFecha}), o.turnr
+      ORDER BY dia ASC, FIELD(o.turnr, 'M', 'T', 'N');
     `;
 
-    // 3. Totales generales del mes usando 'fechar'
+    // 2. Paginación de usuarios por rendimiento total (De mayor a menor)
+    const limitNum = parseInt(limit, 10) || 10;
+    const offsetNum = parseInt(offset, 10) || 0;
+    
+    const sqlPaginarUsuarios = `
+      SELECT us.id_usuario, COUNT(o.id_ocurrencia) AS total_ocurrencias
+      FROM ocurrencia_registro o
+      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      JOIN persona p ON us.id_persona = p.id_persona
+      ${whereClause} ${searchClause}
+      GROUP BY us.id_usuario
+      ORDER BY total_ocurrencias DESC, us.id_usuario ASC
+      LIMIT ? OFFSET ?;
+    `;
+
+    const [paginatedUsersRows] = await connection.query(
+      sqlPaginarUsuarios,
+      [...queryParams, ...searchParams, limitNum, offsetNum]
+    );
+
+    const userIds = paginatedUsersRows.map(row => row.id_usuario);
+
+    // Contar el total de usuarios únicos con estos filtros y búsqueda
+    const sqlTotalUsuarios = `
+      SELECT COUNT(DISTINCT o.id_usuario) AS total_usuarios
+      FROM ocurrencia_registro o
+      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      JOIN persona p ON us.id_persona = p.id_persona
+      ${whereClause} ${searchClause};
+    `;
+    const [totalUsersRows] = await connection.query(sqlTotalUsuarios, [...queryParams, ...searchParams]);
+    const totalUsuariosCount = totalUsersRows[0]?.total_usuarios || 0;
+
+    let matrizRows = [];
+    if (userIds.length > 0) {
+      const placeholders = userIds.map(() => '?').join(',');
+      const sqlMatrizUsuarios = `
+        SELECT 
+          COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
+          DAY(${campoFecha}) AS dia,
+          o.turnr AS turno,
+          o.id_modalidad,
+          COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
+          COALESCE(ori.descripcion, 'SIN ORIGEN') AS origen_descripcion,
+          COUNT(o.id_ocurrencia) AS total
+        FROM ocurrencia_registro o
+        LEFT JOIN origen ori ON o.id_origen = ori.id_origen
+        LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+        LEFT JOIN persona p ON us.id_persona = p.id_persona
+        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+        ${whereClause} ${searchClause} AND o.id_usuario IN (${placeholders})
+        GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(${campoFecha}), o.turnr, o.id_modalidad, m.nombre, ori.descripcion
+        ORDER BY usuario ASC;
+      `;
+      const [rows] = await connection.query(sqlMatrizUsuarios, [...queryParams, ...searchParams, ...userIds]);
+      matrizRows = rows;
+    }
+
+    // 3. Totales generales del mes
     const sqlTotalesMes = `
       SELECT 
         COUNT(o.id_ocurrencia) AS total_mes,
-        SUM(CASE WHEN o.turnrm = 'M' THEN 1 ELSE 0 END) AS total_mañana,
-        SUM(CASE WHEN o.turnrm = 'T' THEN 1 ELSE 0 END) AS total_tarde,
-        SUM(CASE WHEN o.turnrm = 'N' THEN 1 ELSE 0 END) AS total_noche
+        SUM(CASE WHEN o.turnr = 'M' THEN 1 ELSE 0 END) AS total_mañana,
+        SUM(CASE WHEN o.turnr = 'T' THEN 1 ELSE 0 END) AS total_tarde,
+        SUM(CASE WHEN o.turnr = 'N' THEN 1 ELSE 0 END) AS total_noche
       FROM ocurrencia_registro o
-      ${whereClause};
+      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      JOIN persona p ON us.id_persona = p.id_persona
+      ${whereClause} ${searchClause};
     `;
 
+    // 4. Catálogos (Modalidades y Orígenes)
     const [modalidadesRows] = await connection.query(`SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC`);
-    const [diarioRows] = await connection.query(sqlDiarioTurnos, queryParams);
-    const [matrizRows] = await connection.query(sqlMatrizUsuarios, queryParams);
-    const [totalesRows] = await connection.query(sqlTotalesMes, queryParams);
+    const [origenesRows] = await connection.query(`SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC`); // <--- Agregado
+    
+    const [diarioRows] = await connection.query(sqlDiarioTurnos, [...queryParams, ...searchParams]);
+    const [totalesRows] = await connection.query(sqlTotalesMes, [...queryParams, ...searchParams]);
 
     res.json({
       success: true,
+      modo_usado: modo,
+      campo_fecha_usado: campoFecha,
       evolucion_diaria_turnos: diarioRows,
       matriz_usuarios: matrizRows,
+      total_usuarios_count: totalUsuariosCount,
       totales_mes: totalesRows[0] || { total_mes: 0, total_mañana: 0, total_tarde: 0, total_noche: 0 },
       modalidades_catalogo: modalidadesRows,
+      origenes_catalogo: origenesRows, // <--- Enviado al frontend
     });
   } catch (error) {
-    console.error("ERROR EN /ocurrencias/estadisticas-mensuales:", error);
+    console.error("ERROR EN /ocurrencias/estadisticas-mensuales3:", error);
     res.status(500).json({ success: false, error: error.message });
   } finally {
     if (connection) connection.release();
@@ -11161,6 +11675,165 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
 });
 
 
+app.get("/ocurrencias/estadisticas-mensualespara", async (req, res) => {
+  let connection;
+  try {
+    connection = await db.getConnection();
+
+    const mes = req.query.mes || new Date().getMonth() + 1;
+    const anio = req.query.anio || new Date().getFullYear();
+    const idModalidad = req.query.id_modalidad;
+    const idOrigen = req.query.id_origen;
+    const modo = req.query.modo || "turnos";
+    const busqueda = req.query.busqueda || "";
+    
+    const limit = parseInt(req.query.limit) || 10;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+
+    const campoFecha = modo === "normal" ? "o.fecha_evento" : "o.fechar";
+
+    let whereClause = `WHERE MONTH(${campoFecha}) = ? AND YEAR(${campoFecha}) = ?`;
+    let queryParams = [mes, anio];
+
+    if (idModalidad) {
+      whereClause += ` AND o.id_modalidad = ?`;
+      queryParams.push(idModalidad);
+    }
+
+    if (idOrigen) {
+      whereClause += ` AND o.id_origen = ?`;
+      queryParams.push(idOrigen);
+    }
+
+    // Filtro dinámico por nombre o apellidos del personal
+    let searchClause = "";
+    let searchParams = [];
+    if (busqueda.trim() !== "") {
+      searchClause = ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) LIKE ?)`;
+      const termino = `%${busqueda.trim()}%`;
+      searchParams = [termino, termino, termino, termino];
+    }
+
+    // 1. Evolución diaria
+    const sqlDiarioTurnos = `
+      SELECT 
+        DAY(${campoFecha}) AS dia,
+        o.turnr AS turno,
+        COUNT(o.id_ocurrencia) AS total
+      FROM ocurrencia_registro o
+      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      LEFT JOIN persona p ON us.id_persona = p.id_persona
+      ${whereClause} ${searchClause} AND o.turnr IN ('M', 'T', 'N')
+      GROUP BY DAY(${campoFecha}), o.turnr
+      ORDER BY dia ASC, FIELD(o.turnr, 'M', 'T', 'N');
+    `;
+
+    // 2. Paginación de usuarios por rendimiento total (De mayor a menor)
+    const limitNum = parseInt(limit, 10) || 10;
+    const offsetNum = parseInt(offset, 10) || 0;
+    
+    const sqlPaginarUsuarios = `
+      SELECT us.id_usuario, COUNT(o.id_ocurrencia) AS total_ocurrencias
+      FROM ocurrencia_registro o
+      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      JOIN persona p ON us.id_persona = p.id_persona
+      ${whereClause} ${searchClause}
+      GROUP BY us.id_usuario
+      ORDER BY total_ocurrencias DESC, us.id_usuario ASC
+      LIMIT ? OFFSET ?;
+    `;
+
+    const [paginatedUsersRows] = await connection.query(
+      sqlPaginarUsuarios,
+      [...queryParams, ...searchParams, limitNum, offsetNum]
+    );
+
+    const userIds = paginatedUsersRows.map(row => row.id_usuario);
+
+    // Contar el total de usuarios únicos con estos filtros y búsqueda
+    const sqlTotalUsuarios = `
+      SELECT COUNT(DISTINCT o.id_usuario) AS total_usuarios
+      FROM ocurrencia_registro o
+      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      JOIN persona p ON us.id_persona = p.id_persona
+      ${whereClause} ${searchClause};
+    `;
+    const [totalUsersRows] = await connection.query(sqlTotalUsuarios, [...queryParams, ...searchParams]);
+    const totalUsuariosCount = totalUsersRows[0]?.total_usuarios || 0;
+
+    let matrizRows = [];
+    if (userIds.length > 0) {
+      const placeholders = userIds.map(() => '?').join(',');
+      const sqlMatrizUsuarios = `
+        SELECT 
+          COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
+          DAY(${campoFecha}) AS dia,
+          o.turnr AS turno,
+          o.id_modalidad,
+          COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
+          COALESCE(ori.descripcion, 'SIN ORIGEN') AS origen_descripcion,
+          COUNT(o.id_ocurrencia) AS total
+        FROM ocurrencia_registro o
+        LEFT JOIN origen ori ON o.id_origen = ori.id_origen
+        LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+        LEFT JOIN persona p ON us.id_persona = p.id_persona
+        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+        ${whereClause} ${searchClause} AND o.id_usuario IN (${placeholders})
+        GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(${campoFecha}), o.turnr, o.id_modalidad, m.nombre, ori.descripcion
+        ORDER BY usuario ASC;
+      `;
+      const [rows] = await connection.query(sqlMatrizUsuarios, [...queryParams, ...searchParams, ...userIds]);
+      matrizRows = rows;
+    }
+
+    // 3. Totales generales del mes
+  // 3. Totales generales del mes e indicadores de datos importantes
+ // 3. Totales generales del mes e indicadores de Detalle Paramédico
+    const sqlTotalesMes = `
+      SELECT 
+        COUNT(o.id_ocurrencia) AS total_mes,
+        SUM(CASE WHEN o.turnr = 'M' THEN 1 ELSE 0 END) AS total_mañana,
+        SUM(CASE WHEN o.turnr = 'T' THEN 1 ELSE 0 END) AS total_tarde,
+        SUM(CASE WHEN o.turnr = 'N' THEN 1 ELSE 0 END) AS total_noche,
+        SUM(COALESCE(di.por_orden_central, 0)) AS sum_por_orden_central,
+        SUM(COALESCE(di.control_fv_sv, 0)) AS sum_control_fv_sv,
+        SUM(COALESCE(di.inyectable, 0)) AS sum_inyectable,
+        SUM(COALESCE(di.curacion_topica, 0)) AS sum_curacion_topica,
+        SUM(COALESCE(di.traslado_urgencia, 0)) AS sum_traslado_urgencia,
+        SUM(COALESCE(di.pertenece_muni, 0)) AS sum_pertenece_muni
+      FROM ocurrencia_registro o
+      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+      JOIN persona p ON us.id_persona = p.id_persona
+      LEFT JOIN detalle_datos_importantes_ocurrencia di ON o.id_ocurrencia = di.id_ocurrencia
+      ${whereClause} ${searchClause};
+    `;
+
+    // 4. Catálogos (Modalidades y Orígenes)
+    const [modalidadesRows] = await connection.query(`SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC`);
+    const [origenesRows] = await connection.query(`SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC`); // <--- Agregado
+    
+    const [diarioRows] = await connection.query(sqlDiarioTurnos, [...queryParams, ...searchParams]);
+    const [totalesRows] = await connection.query(sqlTotalesMes, [...queryParams, ...searchParams]);
+
+    res.json({
+      success: true,
+      modo_usado: modo,
+      campo_fecha_usado: campoFecha,
+      evolucion_diaria_turnos: diarioRows,
+      matriz_usuarios: matrizRows,
+      total_usuarios_count: totalUsuariosCount,
+      totales_mes: totalesRows[0] || { total_mes: 0, total_mañana: 0, total_tarde: 0, total_noche: 0 },
+      modalidades_catalogo: modalidadesRows,
+      origenes_catalogo: origenesRows, // <--- Enviado al frontend
+    });
+  } catch (error) {
+    console.error("ERROR EN /ocurrencias/estadisticas-mensuales3:", error);
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (connection) connection.release();
+  }
+});
 
 app.get("/ocurrencias/estadisticas-mensuales1", async (req, res) => {
   let connection;
@@ -11240,12 +11913,15 @@ app.get("/ocurrencias/total-turno", async (req, res) => {
   try {
     connection = await db.getConnection();
     
-    const ahora = new Date();
-    const tiempoMinutos = ahora.getHours() * 60 + ahora.getMinutes();
+    // Obtenemos la hora actual exacta de Perú desde Node.js
+    const formatoPeru = new Date().toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
+    const fechaPeruObj = new Date(formatoPeru);
+    const horaActual = fechaPeruObj.getHours();
+    const minutoActual = fechaPeruObj.getMinutes();
+    const tiempoMinutos = horaActual * 60 + minutoActual;
 
     let filtroTiempo = "";
 
-    // Mantiene la misma lógica de tiempo de tus turnos, pero SIN tocar id_origen ni id_tipop
     if (tiempoMinutos >= 430 && tiempoMinutos < 900) {
       filtroTiempo = `WHERE o.fecha_evento = CURDATE() AND o.hora_repliegue >= '07:00:00' AND o.hora_repliegue < '15:00:00'`;
     } else if (tiempoMinutos >= 900 && tiempoMinutos < 1320) {
@@ -11257,7 +11933,8 @@ app.get("/ocurrencias/total-turno", async (req, res) => {
       `;
     }
 
-    filtroTiempo += ` AND TIMESTAMP(o.fecha_evento, o.hora_repliegue) <= NOW()`;
+    // Usamos UTC_TIMESTAMP con conversión a Perú en lugar de NOW()
+    filtroTiempo += ` AND TIMESTAMP(o.fecha_evento, o.hora_repliegue) <= CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00')`;
 
     const sqlTotal = `SELECT COUNT(o.id_ocurrencia) AS total FROM ocurrencia_registro o ${filtroTiempo}`;
     

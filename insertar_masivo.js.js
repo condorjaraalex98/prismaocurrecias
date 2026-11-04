@@ -6,7 +6,7 @@ async function generarOcurrenciasMasivas() {
     port: 8889, // Puerto de MAMP para Mac
     user: "root",
     password: "root",
-    database: "restaurado",
+    database: "restaurado1",
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
@@ -39,9 +39,9 @@ async function generarOcurrenciasMasivas() {
   // Seleccionar un usuario fijo (intentamos usar el ID 40 si existe, si no, el primer usuario disponible)
   const idUsuarioFijo = idsUsuariosValidos.includes(40) ? 40 : idsUsuariosValidos[0];
 
-  // Configuración solicitada: 3000 registros en total (500 para el usuario fijo, 2500 variados)
-  const totalRegistros = 3000;
-  const registrosUsuarioFijos = 500;
+  // Configuración solicitada: 157,000 registros en total distribuidos entre varios usuarios
+  const totalRegistros = 157000;
+  const registrosUsuarioFijos = Math.floor(totalRegistros * 0.16); 
   const listaTareasUsuarios = [];
 
   for (let i = 0; i < registrosUsuarioFijos; i++) {
@@ -59,31 +59,63 @@ async function generarOcurrenciasMasivas() {
   const tamañoLote = 3000;     
   let contadorGlobalIndice = 0;
 
-  // Fechas y horas actualizadas solicitadas
-  const fechaEventoFija = "2026-09-28";
-  const horaAlertaFija = "23:54:00";
-  const horaLlegadaFija = "23:54:00";
-  const horaRepliegueFija = "23:54:00"; 
-  const fechaHoraReporteFija = "2026-09-28 23:59:00";
+  // Definición de turnos para distribuir la hora de llegada
+  const rangosTurnos = [
+    { turno: 'M', inicioHora: 7, finHora: 14 },
+    { turno: 'T', inicioHora: 15, finHora: 22 },
+    { turno: 'N', inicioHora: 23, finHora: 6 }
+  ];
 
-  console.log(`🚀 Iniciando generación masiva total de ${totalRegistros} ocurrencias...`);
+  console.log(`🚀 Iniciando generación masiva total de ${totalRegistros} ocurrencias para NOVIEMBRE 2026...`);
+
+  // Fecha base inicial para el incremento secuencial de segundos en fecha_reporte
+  let timestampBaseReporte = new Date("2026-11-01T00:00:00").getTime();
 
   try {
     for (let i = 0; i < listaTareasUsuarios.length; i += tamañoLote) {
       const loteActual = listaTareasUsuarios.slice(i, i + tamañoLote);
       const filasSQLOcurrencia = [];
 
-      console.log(`📦 Procesando lote del ${i + 1} al ${i + loteActual.length}...`);
+      console.log(`📦 Procesando lote del ${i + 1} al ${i + loteActual.length} (${((i / totalRegistros) * 100).toFixed(1)}%)...`);
 
       for (let j = 0; j < loteActual.length; j++) {
         const idUsuario = loteActual[j];
         contadorGlobalIndice++;
         const indiceLocal = i + j + 1;
 
+        // 1. Generar día aleatorio de Noviembre (1 al 30)
+        const diaAleatorio = Math.floor(Math.random() * 30) + 1;
+        const diaStr = String(diaAleatorio).padStart(2, '0');
+        const fechaEventoFija = `2026-11-${diaStr}`;
+
+        // 2. Distribuir aleatoriamente en uno de los 3 turnos
+        const turnoSeleccionado = rangosTurnos[Math.floor(Math.random() * rangosTurnos.length)];
+        
+        let horaAleatoriaNum, minutoAleatorio, segundoAleatorio;
+        if (turnoSeleccionado.turno === 'N' && Math.random() > 0.5) {
+          horaAleatoriaNum = Math.floor(Math.random() * 7); 
+        } else if (turnoSeleccionado.turno === 'N') {
+          horaAleatoriaNum = 23;
+        } else {
+          horaAleatoriaNum = Math.floor(Math.random() * (turnoSeleccionado.finHora - turnoSeleccionado.inicioHora + 1)) + turnoSeleccionado.inicioHora;
+        }
+
+        minutoAleatorio = Math.floor(Math.random() * 60);
+        segundoAleatorio = Math.floor(Math.random() * 60);
+
+        const horaLlegadaFija = `${String(horaAleatoriaNum).padStart(2, '0')}:${String(minutoAleatorio).padStart(2, '0')}:${String(segundoAleatorio).padStart(2, '0')}`;
+        const horaAlertaFija = horaLlegadaFija;
+        const horaRepliegueFija = horaLlegadaFija;
+
+        // 3. Incrementar 1 segundo para la fecha_reporte de forma secuencial
+        timestampBaseReporte += 1000; 
+        const fechaReporteObj = new Date(timestampBaseReporte);
+        const fechaHoraReporteFija = fechaReporteObj.toISOString().slice(0, 19).replace('T', ' ');
+
         // id_modalidad variando del 1 al 100 de forma aleatoria
         const idModalidadAleatoria = Math.floor(Math.random() * 100) + 1;
 
-        // id_origen variando del 1 al 11 de forma aleatoria
+        // id_origen variando del 1 al 11 de forma aleatoria (garantizado aleatorio)
         const idOrigenAleatorio = Math.floor(Math.random() * 11) + 1;
 
         // id_modalidadp original seleccionado de los existentes
@@ -93,25 +125,25 @@ async function generarOcurrenciasMasivas() {
         const idLugarAleatorio = idsLugaresValidos[Math.floor(Math.random() * idsLugaresValidos.length)];
 
         const valoresFila = [
-          connection.escape(`POR LLAMADO DE LA CENTRAL\nUsuario ${idUsuario} - Test ${indiceLocal}`), // 1. descripcion
-          connection.escape(horaAlertaFija),                                     // 2. hora_alerta
-          connection.escape(horaLlegadaFija),                                    // 3. hora_llegada
-          connection.escape(horaRepliegueFija),                                  // 4. hora_repliegue
-          connection.escape(idLugarAleatorio),                                   // 5. id_lugar variable y válido
-          connection.escape(idUsuario),                                          // 6. id_usuario variable/fijo
-          connection.escape(idModalidadAleatoria),                               // 7. id_modalidad variable (1 al 100)
-          connection.escape(idOrigenAleatorio),                                  // 8. id_origen variable (1 al 11)
-          connection.escape(3),                                                  // 9. id_tipop
-          connection.escape(idModalidadPAleatoria),                              // 10. id_modalidadp original
-          connection.escape("-12.073769"),                                       // 11. latitud_gps
-          connection.escape("-77.039673"),                                       // 12. longitud_gps
-          connection.escape(""),                                                 // 13. nombre_punto_gps
-          connection.escape(`xcxzc REF ${indiceLocal}`),                         // 14. referencia
-          connection.escape("SERENAZGO"),                                        // 15. unidad_encargada
-          connection.escape(fechaHoraReporteFija),                               // 16. fecha_reporte fija
-          connection.escape(fechaEventoFija),                                    // 17. fecha_evento fija
-          connection.escape("PENDIENTE"),                                        // 18. estado
-          connection.escape("1"),                                                // 19. grupo
+          connection.escape(`POR LLAMADO DE LA CENTRAL\nUsuario ${idUsuario} Noviembre Test ${indiceLocal}`), 
+          connection.escape(horaAlertaFija),                                     
+          connection.escape(horaLlegadaFija),                                    
+          connection.escape(horaRepliegueFija),                                  
+          connection.escape(idLugarAleatorio),                                   
+          connection.escape(idUsuario),                                          
+          connection.escape(idModalidadAleatoria),                               
+          connection.escape(idOrigenAleatorio),                                  // Origen aleatorio (1-11)
+          connection.escape(3),                                                  
+          connection.escape(idModalidadPAleatoria),                              
+          connection.escape("-12.073769"),                                       
+          connection.escape("-77.039673"),                                       
+          connection.escape(""),                                                 
+          connection.escape(`REF NOV ${indiceLocal}`),                           
+          connection.escape("SERENAZGO"),                                        
+          connection.escape(fechaHoraReporteFija),                               
+          connection.escape(fechaEventoFija),                                    
+          connection.escape("PENDIENTE"),                                        
+          connection.escape("1"),                                                
         ];
 
         filasSQLOcurrencia.push(`(${valoresFila.join(",")})`);
@@ -131,17 +163,17 @@ async function generarOcurrenciasMasivas() {
       const [resultadoOcurrencia] = await connection.query(sqlOcurrencias);
       const primerInsertId = resultadoOcurrencia.insertId;
 
-      // 2. Generar vehículos enlazados usando el ID autoincrementado correcto
+      // 2. Generar vehículos enlazados
       const filasSQLVehiculos = [];
       for (let j = 0; j < filasSQLOcurrencia.length; j++) {
         const idOcurrenciaActual = primerInsertId + j;
         
         const valoresVehiculo = [
-          connection.escape(idOcurrenciaActual), // id_ocurrencia enlazado
-          connection.escape(1),                  // id_tipo_vehiculo
-          connection.escape(1),                  // id_unidad
-          connection.escape("INTEGRADO"),        // tipo_asignacion
-          connection.escape(1),                  // id_pnp
+          connection.escape(idOcurrenciaActual), 
+          connection.escape(1),                  
+          connection.escape(1),                  
+          connection.escape("INTEGRADO"),        
+          connection.escape(1),                  
         ];
 
         filasSQLVehiculos.push(`(${valoresVehiculo.join(",")})`);
@@ -156,26 +188,7 @@ async function generarOcurrenciasMasivas() {
       await connection.query(sqlVehiculos);
     }
 
-    console.log("🎉 Carga masiva total completada con éxito.");
-
-    // --- CONSOLIDADO FINAL ---
-    console.log("\n📊 --- CONSOLIDADO DE LA CARGA ---");
-    const [consolidado] = await connection.query(`
-      SELECT 
-        id_usuario,
-        COUNT(*) AS total_registros,
-        COUNT(DISTINCT id_lugar) AS lugares_diferentes,
-        COUNT(DISTINCT id_modalidad) AS modalidades_diferentes,
-        MIN(fecha_evento) AS fecha_inicio,
-        MAX(fecha_evento) AS fecha_fin,
-        MIN(fecha_reporte) AS reporte_inicial,
-        MAX(fecha_reporte) AS reporte_final
-      FROM ocurrencia_registro
-      WHERE fecha_evento = '2026-09-28' AND hora_llegada = '23:54:00'
-      GROUP BY id_usuario
-      ORDER BY total_registros DESC
-    `);
-    console.table(consolidado);
+    console.log("🎉 Carga masiva de 157k registros en Noviembre con orígenes aleatorios completada con éxito.");
 
   } catch (error) {
     console.error("🔴 Error en la inserción masiva:", error.message);
