@@ -3,50 +3,65 @@ const express = require("express");
 const mysql = require("mysql2/promise");
 const cors = require("cors");
 const multer = require("multer");
-const bodyParser = require("body-parser");
-const cloudinary = require("cloudinary").v2; // Línea 4
+
 const sharp = require("sharp");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
-// Obtiene la fecha y hora actual exacta en Perú (Lima) formateada para MySQL
 
-// ⚡ Límite de concurrencia de Sharp para liberar Event Loop de Node.js en cargas masivas
+// ⚡ Límite de concurrencia y caché desactivado en Sharp para evitar OOM en Render
 sharp.concurrency(1);
+sharp.cache(false);
 
 const app = express();
 
 // ==========================================
-// POOL MYSQL (REQUERIDO PARA 'db')
+// 1. CORS SIEMPRE PRIMERO
+// ==========================================
+app.use(cors());
+
+// Parsers (5mb es suficiente si las fotos van por multipart; sube a 10mb solo si aún hay legacy base64)
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ limit: "5mb", extended: true }));
+app.use("/uploads", express.static("uploads", { maxAge: "1d" }));
+
+// ==========================================
+// 2. POOL MYSQL BLINDADO
 // ==========================================
 const db = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
-  port: process.env.DB_PORT || 8889,
+  port: Number(process.env.DB_PORT) || 8889,
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "root",
   database: process.env.DB_NAME || "restaurado1",
-  connectionLimit: 10,
+  connectionLimit: Number(process.env.DB_POOL_LIMIT) || 15,
   waitForConnections: true,
-  queueLimit: 0,
+  queueLimit: 150, // Evita acumulación infinita de peticiones en RAM si MySQL se satura
+  connectTimeout: 10000,
   enableKeepAlive: true,
   keepAliveInitialDelay: 10000,
-  timezone: "-05:00", // Forzado a UTC-5 para que independientemente de dónde esté el servidor registre la hora correcta
+  timezone: "-05:00",
 });
 
-app.use(express.json({ limit: "25mb" }));
-app.use("/uploads", express.static("uploads", { maxAge: "1d" }));
-app.use(express.urlencoded({ limit: "25mb", extended: true }));
-
-// Middlewares
-app.use(cors());
-app.use(bodyParser.urlencoded({ extended: true }));
-
-// 📸 Configuración de Multer para recibir fotos individuales en RAM
+// ==========================================
+// 3. MULTER CON FILTRO DE IMÁGENES
+// ==========================================
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // Límite de 10MB
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB máximo
+    files: 1,
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith("image/")) {
+      return cb(null, true);
+    }
+    cb(new Error("Solo se permiten archivos de imagen."));
+  },
 });
 
-// Configuración de Cloudflare R2 / S3 Client
+// ==========================================
+// 4. CLOUDFLARE R2 CLIENT
+// ==========================================
 const r2Client = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -57,13 +72,12 @@ const r2Client = new S3Client({
 });
 
 const BUCKET_NAME = process.env.R2_BUCKET_NAME;
-const PUBLIC_DOMAIN = process.env.R2_PUBLIC_DOMAIN;
-// Función limpiadora (ponla arriba, junto a tus funciones o middlewares)
+const PUBLIC_DOMAIN = (process.env.R2_PUBLIC_DOMAIN || "").replace(/\/+$/, "");
+
 function limpiarUrlR2(input) {
   if (!input) return null;
   let texto = typeof input === "string" ? input : JSON.stringify(input);
 
-  // 1. Extraer si viene en formato Markdown [texto](url) o con paréntesis
   const matchMarkdown = texto.match(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/);
   if (matchMarkdown && matchMarkdown[2]) {
     texto = matchMarkdown[2];
@@ -74,646 +88,102 @@ function limpiarUrlR2(input) {
     }
   }
 
-  // 2. Limpiar corchetes, comillas y espacios sobrantes
   texto = texto.replace(/[\[\]'"]+/g, "").trim();
 
-  // 3. Manejo seguro de URLs duplicadas o concatenadas sin espacios
-  const domain = "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
-  if (texto.includes(domain)) {
-    // Partimos el texto por "https://" para aislar los bloques correctos
+  const domainHost = PUBLIC_DOMAIN
+    ? PUBLIC_DOMAIN.replace(/^https?:\/\//, "")
+    : "pub-bce5ad6110584baca6912e8944cd2051.r2.dev";
+
+  if (texto.includes(domainHost)) {
     const partes = texto.split("https://");
-    // Buscamos desde el final la última parte que contenga el dominio de R2
-    const parteValida = partes.reverse().find((p) => p.includes(domain));
+    const parteValida = [...partes].reverse().find((p) => p.includes(domainHost));
     if (parteValida) {
       texto = "https://" + parteValida;
     }
   }
 
-  // 4. Extraer estrictamente la URL limpia resultante
   const matchHttp = texto.match(/(https?:\/\/[^\s\)]+)/);
   if (!matchHttp) return null;
 
-  let urlPura = matchHttp[1];
+  return matchHttp[1].split("?")[0];
+}
+// ==========================================
+// HELPER FECHA PERÚ Y CACHÉ DE CATÁLOGOS
+// ==========================================
+function obtenerFechaHoraPeru(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Lima",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
 
-  // 5. Asegurar limpieza de cualquier carácter extraño al final
-  const finLimpio = urlPura.match(/[^\s\)]+/);
-  return finLimpio ? finLimpio[0] : urlPura;
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return {
+    anio: map.year,
+    mes: map.month,
+    dia: map.day,
+    fecha: `${map.year}-${map.month}-${map.day}`,
+    fechaHora: `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`,
+  };
+}
+
+const CATALOGOS_TTL_MS = 15 * 60 * 1000; // 15 minutos
+const MAX_CACHE_ENTRIES = 300; // Tope de seguridad para no saturar 512 MB RAM
+
+const catalogosCache = new Map();
+const catalogosInFlight = new Map();
+
+async function obtenerConCache(cacheKey, fetcher, ttlMs = CATALOGOS_TTL_MS, forceRefresh = false) {
+  const now = Date.now();
+  const cached = catalogosCache.get(cacheKey);
+
+  if (!forceRefresh && cached && cached.expiresAt > now) {
+    return cached.data;
+  }
+
+  let promise = !forceRefresh ? catalogosInFlight.get(cacheKey) : null;
+  if (!promise) {
+    promise = Promise.resolve()
+      .then(fetcher)
+      .then((data) => {
+        // Limpieza de expirados / exceso de entradas para proteger la RAM
+        if (catalogosCache.size >= MAX_CACHE_ENTRIES) {
+          for (const [k, v] of catalogosCache.entries()) {
+            if (v.expiresAt <= Date.now()) catalogosCache.delete(k);
+          }
+          // Si sigue lleno, borra el más antiguo (FIFO)
+          if (catalogosCache.size >= MAX_CACHE_ENTRIES) {
+            const oldestKey = catalogosCache.keys().next().value;
+            catalogosCache.delete(oldestKey);
+          }
+        }
+
+        catalogosCache.set(cacheKey, { data, expiresAt: Date.now() + ttlMs });
+        return data;
+      })
+      .finally(() => {
+        catalogosInFlight.delete(cacheKey);
+      });
+    catalogosInFlight.set(cacheKey, promise);
+  }
+
+  try {
+    return await promise;
+  } catch (err) {
+    if (cached) return cached.data; // Fallback si MySQL falla momentáneamente
+    throw err;
+  }
 }
 // ==========================================
 // 📸 ENDPOINT NUEVO: SUBIR FOTO ADJUNTA INDIVIDUAL
 // ==========================================
-app.post("/ocurrencias/subir-foto-adjunta", upload.single("foto"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: "No se envió ninguna foto." });
-    }
-
-    // 📌 RECIBIMOS LOS DATOS DESDE EL FORMDATA DE LA APP
-    const { id_modalidad, fecha_evento } = req.body;
-    
-    // Si id_modalidad llega vacío o undefined, imprimimos una alerta en consola para depurar
-    console.log("📥 Recibiendo subida individual - ID Modalidad:", id_modalidad);
-
-    const bufferOptimizado = await sharp(req.file.buffer)
-      .rotate()
-      .resize({ width: 1200, withoutEnlargement: true })
-      .jpeg({ quality: 75 })
-      .toBuffer();
-
-    let anio = "2026";
-    let mes = "10";
-    let dia = "15";
-
-    if (fecha_evento && /^\d{4}-\d{2}-\d{2}$/.test(fecha_evento)) {
-      const partes = fecha_evento.split("-");
-      anio = partes[0];
-      mes = partes[1];
-      dia = partes[2];
-    } else {
-      const fechaActual = new Date();
-      anio = fechaActual.getFullYear();
-      mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
-      dia = String(fechaActual.getDate()).padStart(2, "0");
-    }
-
-    const timestamp = Date.now();
-    const randomId = crypto.randomBytes(4).toString("hex");
-
-    // Si id_modalidad viene nulo, usaremos un texto de respaldo pero sabremos que faltaba enviarlo
-    const carpetaModalidad = id_modalidad || "sin_modalidad";
-    const nombreArchivo = `ocurrencias/modalidad_${carpetaModalidad}/${anio}/${mes}/${dia}/foto_${timestamp}_${randomId}.jpg`;
-
-    await r2Client.send(
-      new PutObjectCommand({
-        Bucket: BUCKET_NAME,
-        Key: nombreArchivo,
-        Body: bufferOptimizado,
-        ContentType: "image/jpeg",
-      })
-    );
-
-    const urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
-
-    return res.json({
-      success: true,
-      url_imagen: urlImagen,
-      public_id: nombreArchivo,
-    });
-  } catch (error) {
-    console.error("🔴 Error al subir foto adjunta:", error.message);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
+// 1. ENDPOINT DE REGISTRO PRINCIPAL DE OCURRENCIAS
 // ==========================================
-// FUNCIÓN EN SEGUNDO PLANO (Sharp + R2)
-// ==========================================
-async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool, id_modalidad, fecha_evento) {
-  console.log(`\n==================================================`);
-  console.log(`⏳ INICIANDO PROCESO EN SEGUNDO PLANO`);
-  console.log(`📌 Ocurrencia ID: #${id_ocurrencia} | Modalidad: #${id_modalidad} | Fecha: ${fecha_evento}`);
-  console.log(`📸 Cantidad de fotos recibidas: ${fotos ? fotos.length : 0}`);
-  console.log(`==================================================`);
-
-  if (!fotos || !Array.isArray(fotos) || fotos.length === 0) {
-    console.warn(`⚠️ No se recibieron fotos en el array para la ocurrencia #${id_ocurrencia}`);
-    return;
-  }
-
-  for (let [idx, f] of fotos.entries()) {
-    try {
-      console.log(`\n🔍 Procesando foto index [${idx}]...`);
-
-      let bufferOriginal = null;
-
-      if (f && f.archivo_real) {
-        console.log(`📦 Detectado archivo real físico en foto [${idx}]`);
-        if (typeof f.archivo_real.arrayBuffer === "function") {
-          const arrayBuffer = await f.archivo_real.arrayBuffer();
-          bufferOriginal = Buffer.from(arrayBuffer);
-        } else if (Buffer.isBuffer(f.archivo_real)) {
-          bufferOriginal = f.archivo_real;
-        }
-      } else {
-        let base64Data = null;
-        if (typeof f === "string") {
-          base64Data = f;
-        } else if (f && f.base64_data) {
-          base64Data = f.base64_data;
-        } else if (f && f.uri) {
-          base64Data = f.uri;
-        } else if (f && f.url_imagen) {
-          base64Data = f.url_imagen;
-        }
-
-        if (!base64Data) {
-          console.error(`❌ La foto [${idx}] no contiene una estructura válida.`, JSON.stringify(f));
-          continue;
-        }
-
-        // Si ya es una URL web existente, la limpiamos y registramos directo en BD
-        if (typeof base64Data === "string" && (base64Data.includes("r2.dev") || base64Data.startsWith("http"))) {
-          const urlLimpiaParaBD = limpiarUrlR2(base64Data);
-       
-
-          const publicIdExistente = urlLimpiaParaBD && urlLimpiaParaBD.includes(PUBLIC_DOMAIN)
-            ? urlLimpiaParaBD.replace(`${PUBLIC_DOMAIN}/`, "")
-            : null;
-
-          await dbPool.query(
-            "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
-            [id_ocurrencia, urlLimpiaParaBD, publicIdExistente],
-          );
-          continue;
-        }
-
-        // Limpiar y convertir Base64 a Buffer
-        const base64Clean = base64Data.replace(/^data:image\/\w+;base64,/, "");
-        bufferOriginal = Buffer.from(base64Clean, "base64");
-      }
-
-      if (!bufferOriginal) {
-        console.error(`❌ No se pudo obtener el buffer de la foto [${idx}]`);
-        continue;
-      }
-
-      // 3. OPTIMIZAR CON SHARP Y AUTOROTACIÓN
-      console.log(`⚙️ Comprimiendo foto [${idx}] con Sharp...`);
-      const bufferOptimizado = await sharp(bufferOriginal)
-        .rotate()
-        .resize({ width: 1200, withoutEnlargement: true })
-        .jpeg({ quality: 75 })
-        .toBuffer();
-
-      const timestamp = Date.now();
-      const randomId = crypto.randomBytes(4).toString("hex");
-
-      // 📅 EXTRACCIÓN DE AÑO, MES Y DÍA BASADO EN LA FECHA DEL EVENTO (YYYY-MM-DD)
-      let anio = "2026";
-      let mes = "10";
-      let dia = "15";
-
-      if (fecha_evento && /^\d{4}-\d{2}-\d{2}$/.test(fecha_evento)) {
-        const partes = fecha_evento.split("-");
-        anio = partes[0];
-        mes = partes[1];
-        dia = partes[2];
-      }
-
-      // 📂 CARPETA ORGANIZADA POR MODALIDAD Y FECHA EXACTA (AÑO / MES / DÍA)
-      const carpetaModalidad = id_modalidad || "sin_modalidad";
-      const nombreArchivo = `ocurrencias/modalidad_${carpetaModalidad}/${anio}/${mes}/${dia}/${id_ocurrencia}_${idx}_${timestamp}_${randomId}.jpg`;
-
-      console.log(`📁 RUTA GENERADA PARA R2: ${nombreArchivo}`);
-
-      // 4. SUBIR A CLOUDFLARE R2
-      await r2Client.send(
-        new PutObjectCommand({
-          Bucket: BUCKET_NAME,
-          Key: nombreArchivo,
-          Body: bufferOptimizado,
-          ContentType: "image/jpeg",
-        }),
-      );
-
-      const urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
-
-      // 5. GUARDAR EN MYSQL
-      await dbPool.query(
-        "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES (?, ?, ?)",
-        [id_ocurrencia, urlImagen, nombreArchivo],
-      );
-
-      console.log(`✅ ¡FOTO [${idx + 1}] GUARDADA EXITOSAMENTE EN R2 Y MYSQL!`);
-    } catch (err) {
-      console.error(`🔴 ERROR CRÍTICO EN FOTO [${idx + 1}]:`, err.message);
-    }
-  }
-}
-// ==========================================
-// 📝 ENDPOINT DE REGISTRO DE OCURRENCIA
-// ==========================================
-app.post("/ocurrencias/registrar/modr2x", async (req, res) => {
-  let connection;
-  try {
-    const {
-      id_usuario,
-      id_lugar,
-      id_modalidad,
-      id_origen,
-      id_camara,
-      id_tipop,
-      id_modalidadp,
-      descripcion,
-      hora_alerta,
-      hora_llegada,
-      hora_repliegue,
-      latitud_gps,
-      longitud_gps,
-      nombre_punto_gps,
-      referencia,
-      unidad_encargada,
-      fecha_evento,
-      grupo,
-      turno,
-      fotos,
-      estadoOcurrencia,
-      vehiculos_detalle,
-      id_personal_ids,
-      detalle_llamada,
-      agresores_detalle,
-      victimas_detalle,
-    } = req.body;
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-
-    // 1. INSERTAR OCURRENCIA PRINCIPAL
-    const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-            descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-            id_lugar, id_usuario, id_modalidad, id_origen,
-            id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
-            nombre_punto_gps, referencia, unidad_encargada, 
-            fecha_reporte, fecha_evento, estado, grupo,turno
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?)`;
-
-    const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion,
-      hora_alerta || null,
-      hora_llegada || null,
-      hora_repliegue || null,
-      id_lugar,
-      id_usuario,
-      id_modalidad,
-      id_origen,
-      id_tipop || null,
-      id_modalidadp || null,
-      latitud_gps || 0,
-      longitud_gps || 0,
-      nombre_punto_gps || "",
-      referencia || "",
-      unidad_encargada || "SERENAZGO",
-      fecha_evento,
-      estadoOcurrencia, 
-      grupo,
-      turno || null,
-    ]);
-
-    const id_nueva_ocurrencia = resOcurrencia.insertId;
-
-    // 2. INSERTAR DETALLE DE CÁMARAS
-    if (id_camara) {
-      let idsCam = Array.isArray(id_camara)
-        ? id_camara
-        : typeof id_camara === "string"
-          ? id_camara.split(",")
-          : [];
-      const idsCamLimpios = idsCam
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
-      if (idsCamLimpios.length > 0) {
-        const valuesCamara = idsCamLimpios.map((camId) => [
-          id_nueva_ocurrencia,
-          camId,
-        ]);
-        await connection.query(
-          "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
-          [valuesCamara],
-        );
-      }
-    }
-
-    // 3. INSERTAR PERSONAL DE APOYO
-    if (id_personal_ids) {
-      let idsPers = Array.isArray(id_personal_ids)
-        ? id_personal_ids
-        : typeof id_personal_ids === "string"
-          ? id_personal_ids.split(",")
-          : [];
-      const idsPersLimpios = idsPers
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
-      if (idsPersLimpios.length > 0) {
-        const valuesPersonal = idsPersLimpios.map((persId) => [
-          id_nueva_ocurrencia,
-          persId,
-        ]);
-        await connection.query(
-          "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
-          [valuesPersonal],
-        );
-      }
-    }
-
-    // 4. INSERTAR VEHÍCULOS
-    if (vehiculos_detalle && vehiculos_detalle.length > 0) {
-      const valuesV = vehiculos_detalle.map((v) => [
-        id_nueva_ocurrencia,
-        v.id_tipo_vehiculo,
-        v.id_unidad,
-        v.tipo_asignacion,
-        v.id_pnp,
-      ]);
-      await connection.query(
-        `INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?`,
-        [valuesV],
-      );
-    }
-
-    // 5. INSERTAR DETALLE DE LLAMADA
-    if (detalle_llamada && detalle_llamada.numero_telefono) {
-      await connection.query(
-        "INSERT INTO detalle_llamada_ocurrencia (id_ocurrencia, numero_telefono, nombre_informante) VALUES (?, ?, ?)",
-        [
-          id_nueva_ocurrencia,
-          detalle_llamada.numero_telefono,
-          detalle_llamada.nombre_informante || "Sin dato",
-        ],
-      );
-    }
-
-    // 6. INSERTAR AGRESORES
-    if (
-      agresores_detalle &&
-      Array.isArray(agresores_detalle) &&
-      agresores_detalle.length > 0
-    ) {
-      const valuesAgresores = agresores_detalle.map((a) => [
-        id_nueva_ocurrencia,
-        a.nombre_agresor || "N.N.",
-        a.id_tipo_vehiculo || null,
-        a.placa_agresor || null,
-      ]);
-      await connection.query(
-        "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?",
-        [valuesAgresores],
-      );
-    }
-
-    // 7. INSERTAR VÍCTIMAS
-    if (
-      victimas_detalle &&
-      Array.isArray(victimas_detalle) &&
-      victimas_detalle.length > 0
-    ) {
-      const valuesVictimas = victimas_detalle.map((v) => [
-        id_nueva_ocurrencia,
-        v.nombre_victima || "N.N.",
-        v.id_tipo_vehiculo || null,
-        v.placa_victima || null,
-        v.id_relacion_v || null,
-      ]);
-      await connection.query(
-        "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?",
-        [valuesVictimas],
-      );
-    }
-
-    await connection.commit();
-
-    // 🚀 RESPUESTA INMEDIATA AL USUARIO
-    res.status(201).json({ success: true, id: id_nueva_ocurrencia });
-
-    // =========================================================
-    // PROCESAR Y SUBIR FOTOS EN SEGUNDO PLANO
-    // =========================================================
-   if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(
-        id_nueva_ocurrencia, 
-        fotos, 
-        db, 
-        id_modalidad,     // 👈 Usamos el ID de la modalidad
-        fecha_evento      // 👈 Usamos la fecha exacta seleccionada en el formulario
-      ).catch((err) => {
-        console.error("🔴 Error crítico general en segundo plano de fotos:", err.message);
-      });
-    }
-  } catch (error) {
-    if (connection) await connection.rollback();
-    console.error("🔴 ERROR:", error.message);
-    if (!res.headersSent) {
-      res.status(400).json({ success: false, error: error.message });
-    }
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-// ==========================================
-// INICIO DEL SERVIDOR
-// ==========================================
-
-app.post("/ocurrencias/registrar/modr2s", async (req, res) => {
-  let connection;
-  try {
-    const {
-      id_usuario,
-      id_lugar,
-      id_modalidad,
-      id_origen,
-      id_camara,
-      id_tipop,
-      id_modalidadp,
-      descripcion,
-      hora_alerta,
-      hora_llegada,
-      hora_repliegue,
-      latitud_gps,
-      longitud_gps,
-      nombre_punto_gps,
-      referencia,
-      unidad_encargada,
-      fecha_evento,
-      grupo,
-      turno,
-      fotos,
-      estadoOcurrencia,
-      vehiculos_detalle,
-      id_personal_ids,
-      detalle_llamada,
-      agresores_detalle,
-      victimas_detalle,
-    } = req.body;
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-const fechaReportePeru = new Date().toLocaleString("sv-SE", { timeZone: "America/Lima" });
-  
-   // 1. INSERTAR OCURRENCIA PRINCIPAL
-    const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-            descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-            id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
-            id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
-            nombre_punto_gps, referencia, unidad_encargada, 
-            fecha_reporte, fecha_evento, estado, grupo, turno
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?)`;
-
-    const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion,                     // 1
-      hora_alerta || null,             // 2
-      hora_llegada || null,            // 3
-      hora_repliegue || null,          // 4
-      id_lugar,                        // 5
-      id_usuario,                      // 6
-      id_modalidad,                    // 7 (id_modalidad principal)
-      id_modalidad,                    // 8 (id_modalidad_inicial)
-   id_origen,                       // 10
-      id_tipop || null,                // 11
-      id_modalidadp || null,           // 12
-      latitud_gps || 0,                // 13
-      longitud_gps || 0,               // 14
-      nombre_punto_gps || "",          // 15
-      referencia || "",                // 16
-      unidad_encargada || "SERENAZGO",
-  fecha_evento,                    // 18
-      estadoOcurrencia,                // 19
-      grupo,                           // 20
-      turno || null                    // 21
-    ]);
-
-    const id_nueva_ocurrencia = resOcurrencia.insertId;
-
-    // 2. INSERTAR DETALLE DE CÁMARAS
-    if (id_camara) {
-      let idsCam = Array.isArray(id_camara)
-        ? id_camara
-        : typeof id_camara === "string"
-          ? id_camara.split(",")
-          : [];
-      const idsCamLimpios = idsCam
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
-      if (idsCamLimpios.length > 0) {
-        const valuesCamara = idsCamLimpios.map((camId) => [
-          id_nueva_ocurrencia,
-          camId,
-        ]);
-        await connection.query(
-          "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
-          [valuesCamara],
-        );
-      }
-    }
-
-    // 3. INSERTAR PERSONAL DE APOYO
-    if (id_personal_ids) {
-      let idsPers = Array.isArray(id_personal_ids)
-        ? id_personal_ids
-        : typeof id_personal_ids === "string"
-          ? id_personal_ids.split(",")
-          : [];
-      const idsPersLimpios = idsPers
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
-      if (idsPersLimpios.length > 0) {
-        const valuesPersonal = idsPersLimpios.map((persId) => [
-          id_nueva_ocurrencia,
-          persId,
-        ]);
-        await connection.query(
-          "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
-          [valuesPersonal],
-        );
-      }
-    }
-
-    // 4. INSERTAR VEHÍCULOS
-    if (vehiculos_detalle && vehiculos_detalle.length > 0) {
-      const valuesV = vehiculos_detalle.map((v) => [
-        id_nueva_ocurrencia,
-        v.id_tipo_vehiculo,
-        v.id_unidad,
-        v.tipo_asignacion,
-        v.id_pnp,
-      ]);
-      await connection.query(
-        `INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?`,
-        [valuesV],
-      );
-    }
-
-    // 5. INSERTAR DETALLE DE LLAMADA
-    if (detalle_llamada && detalle_llamada.numero_telefono) {
-      await connection.query(
-        "INSERT INTO detalle_llamada_ocurrencia (id_ocurrencia, numero_telefono, nombre_informante) VALUES (?, ?, ?)",
-        [
-          id_nueva_ocurrencia,
-          detalle_llamada.numero_telefono,
-          detalle_llamada.nombre_informante || "Sin dato",
-        ],
-      );
-    }
-
-    // 6. INSERTAR AGRESORES
-    if (
-      agresores_detalle &&
-      Array.isArray(agresores_detalle) &&
-      agresores_detalle.length > 0
-    ) {
-      const valuesAgresores = agresores_detalle.map((a) => [
-        id_nueva_ocurrencia,
-        a.nombre_agresor || "N.N.",
-        a.id_tipo_vehiculo || null,
-        a.placa_agresor || null,
-      ]);
-      await connection.query(
-        "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?",
-        [valuesAgresores],
-      );
-    }
-
-    // 7. INSERTAR VÍCTIMAS
-    if (
-      victimas_detalle &&
-      Array.isArray(victimas_detalle) &&
-      victimas_detalle.length > 0
-    ) {
-      const valuesVictimas = victimas_detalle.map((v) => [
-        id_nueva_ocurrencia,
-        v.nombre_victima || "N.N.",
-        v.id_tipo_vehiculo || null,
-        v.placa_victima || null,
-        v.id_relacion_v || null,
-      ]);
-      await connection.query(
-        "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?",
-        [valuesVictimas],
-      );
-    }
-
-    await connection.commit();
-
-    // 🚀 RESPUESTA INMEDIATA AL USUARIO
-    res.status(201).json({ success: true, id: id_nueva_ocurrencia });
-
-    // =========================================================
-    // PROCESAR Y SUBIR FOTOS EN SEGUNDO PLANO
-    // =========================================================
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(
-        (err) => {
-          console.error(
-            "🔴 Error crítico general en segundo plano de fotos:",
-            err.message,
-          );
-        },
-      );
-    }
-  } catch (error) {
-    if (connection) await connection.rollback();
-    console.error("🔴 ERROR:", error.message);
-    if (!res.headersSent) {
-      res.status(400).json({ success: false, error: error.message });
-    }
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-// ==========================================
-// INICIO DEL SERVIDOR
-// ==========================================
-
 app.post("/ocurrencias/registrar/modr2", async (req, res) => {
   let connection;
   try {
@@ -744,114 +214,115 @@ app.post("/ocurrencias/registrar/modr2", async (req, res) => {
       detalle_llamada,
       agresores_detalle,
       victimas_detalle,
-    } = req.body;
+    } = req.body || {};
+
+    if (!id_usuario || !id_lugar || !id_modalidad || !descripcion || !fecha_evento) {
+      return res.status(400).json({
+        success: false,
+        error: "Faltan campos obligatorios (usuario, lugar, modalidad, descripción o fecha).",
+      });
+    }
+
+    if (String(descripcion).length > 3000) {
+      return res.status(400).json({
+        success: false,
+        error: "La descripción excede el límite permitido.",
+      });
+    }
+
+    if (Array.isArray(fotos) && fotos.length > 10) {
+      return res.status(400).json({
+        success: false,
+        error: "Se excedió el máximo de fotos permitidas por registro.",
+      });
+    }
 
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-const fechaActual = new Date();
-    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
-    const fechaPeruObj = new Date(formatoPeru);
+    const { fechaHora: fechaReportePeru } = obtenerFechaHoraPeru();
 
-    const anio = fechaPeruObj.getFullYear();
-    const mes = String(fechaPeruObj.getMonth() + 1).padStart(2, "0");
-    const dia = String(fechaPeruObj.getDate()).padStart(2, "0");
-    const hora = String(fechaPeruObj.getHours()).padStart(2, "0");
-    const minuto = String(fechaPeruObj.getMinutes()).padStart(2, "0");
-    const segundo = String(fechaPeruObj.getSeconds()).padStart(2, "0");
-
-    const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
-   // 1. INSERTAR OCURRENCIA PRINCIPAL
+    // 1. INSERTAR OCURRENCIA PRINCIPAL
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-            descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-            id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
-            id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
-            nombre_punto_gps, referencia, unidad_encargada, 
-            fecha_reporte, fecha_evento, estado, grupo, turno
-        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      descripcion, hora_alerta, hora_llegada, hora_repliegue, 
+      id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
+      id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
+      nombre_punto_gps, referencia, unidad_encargada, 
+      fecha_reporte, fecha_evento, estado, grupo, turno
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion,                     // 1
-      hora_alerta || null,             // 2
-      hora_llegada || null,            // 3
-      hora_repliegue || null,          // 4
-      id_lugar,                        // 5
-      id_usuario,                      // 6
-      id_modalidad,                    // 7 (id_modalidad principal)
-      id_modalidad,                    // 8 (id_modalidad_inicial)
-   id_origen,                       // 10
-      id_tipop || null,                // 11
-      id_modalidadp || null,           // 12
-      latitud_gps || 0,                // 13
-      longitud_gps || 0,               // 14
-      nombre_punto_gps || "",          // 15
-      referencia || "",                // 16
+      String(descripcion).trim(),
+      hora_alerta || null,
+      hora_llegada || null,
+      hora_repliegue || null,
+      Number(id_lugar),
+      Number(id_usuario),
+      Number(id_modalidad),
+      Number(id_modalidad),
+      id_origen ? Number(id_origen) : 1,
+      id_tipop ? Number(id_tipop) : null,
+      id_modalidadp ? Number(id_modalidadp) : null,
+      latitud_gps || 0,
+      longitud_gps || 0,
+      nombre_punto_gps || "",
+      referencia || "",
       unidad_encargada || "SERENAZGO",
-      fechaReportePeru,// 17
-      fecha_evento,                    // 18
-      estadoOcurrencia,                // 19
-      grupo,                           // 20
-      turno || null                    // 21
+      fechaReportePeru,
+      fecha_evento,
+      estadoOcurrencia || "PENDIENTE",
+      grupo || null,
+      turno || null,
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
 
     // 2. INSERTAR DETALLE DE CÁMARAS
     if (id_camara) {
-      let idsCam = Array.isArray(id_camara)
+      const idsCam = Array.isArray(id_camara)
         ? id_camara
         : typeof id_camara === "string"
-          ? id_camara.split(",")
-          : [];
-      const idsCamLimpios = idsCam
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
+        ? id_camara.split(",")
+        : [];
+      const idsCamLimpios = [...new Set(idsCam.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id)))];
       if (idsCamLimpios.length > 0) {
-        const valuesCamara = idsCamLimpios.map((camId) => [
-          id_nueva_ocurrencia,
-          camId,
-        ]);
+        const valuesCamara = idsCamLimpios.map((camId) => [id_nueva_ocurrencia, camId]);
         await connection.query(
           "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
-          [valuesCamara],
+          [valuesCamara]
         );
       }
     }
 
     // 3. INSERTAR PERSONAL DE APOYO
     if (id_personal_ids) {
-      let idsPers = Array.isArray(id_personal_ids)
+      const idsPers = Array.isArray(id_personal_ids)
         ? id_personal_ids
         : typeof id_personal_ids === "string"
-          ? id_personal_ids.split(",")
-          : [];
-      const idsPersLimpios = idsPers
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
+        ? id_personal_ids.split(",")
+        : [];
+      const idsPersLimpios = [...new Set(idsPers.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id)))];
       if (idsPersLimpios.length > 0) {
-        const valuesPersonal = idsPersLimpios.map((persId) => [
-          id_nueva_ocurrencia,
-          persId,
-        ]);
+        const valuesPersonal = idsPersLimpios.map((persId) => [id_nueva_ocurrencia, persId]);
         await connection.query(
           "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
-          [valuesPersonal],
+          [valuesPersonal]
         );
       }
     }
 
     // 4. INSERTAR VEHÍCULOS
-    if (vehiculos_detalle && vehiculos_detalle.length > 0) {
+    if (Array.isArray(vehiculos_detalle) && vehiculos_detalle.length > 0) {
       const valuesV = vehiculos_detalle.map((v) => [
         id_nueva_ocurrencia,
         v.id_tipo_vehiculo,
         v.id_unidad,
         v.tipo_asignacion,
-        v.id_pnp,
+        v.id_pnp || null,
       ]);
       await connection.query(
-        `INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?`,
-        [valuesV],
+        "INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?",
+        [valuesV]
       );
     }
 
@@ -863,16 +334,12 @@ const fechaActual = new Date();
           id_nueva_ocurrencia,
           detalle_llamada.numero_telefono,
           detalle_llamada.nombre_informante || "Sin dato",
-        ],
+        ]
       );
     }
 
     // 6. INSERTAR AGRESORES
-    if (
-      agresores_detalle &&
-      Array.isArray(agresores_detalle) &&
-      agresores_detalle.length > 0
-    ) {
+    if (Array.isArray(agresores_detalle) && agresores_detalle.length > 0) {
       const valuesAgresores = agresores_detalle.map((a) => [
         id_nueva_ocurrencia,
         a.nombre_agresor || "N.N.",
@@ -881,16 +348,12 @@ const fechaActual = new Date();
       ]);
       await connection.query(
         "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?",
-        [valuesAgresores],
+        [valuesAgresores]
       );
     }
 
     // 7. INSERTAR VÍCTIMAS
-    if (
-      victimas_detalle &&
-      Array.isArray(victimas_detalle) &&
-      victimas_detalle.length > 0
-    ) {
+    if (Array.isArray(victimas_detalle) && victimas_detalle.length > 0) {
       const valuesVictimas = victimas_detalle.map((v) => [
         id_nueva_ocurrencia,
         v.nombre_victima || "N.N.",
@@ -900,38 +363,209 @@ const fechaActual = new Date();
       ]);
       await connection.query(
         "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?",
-        [valuesVictimas],
+        [valuesVictimas]
       );
     }
 
-    await connection.commit();
+    // 8. FOTOS YA SUBIDAS A R2 (DENTRO DE LA TRANSACCIÓN) VS LEGACY
+    const fotosYaSubidas = [];
+    const fotosPendientesSubir = [];
 
-    // 🚀 RESPUESTA INMEDIATA AL USUARIO
+    if (Array.isArray(fotos) && fotos.length > 0) {
+      for (const f of fotos) {
+        const posibleUrl =
+          typeof f === "string"
+            ? f
+            : f?.url_imagen || (typeof f?.uri === "string" && f.uri.startsWith("http") ? f.uri : null);
+
+        if (typeof posibleUrl === "string" && (posibleUrl.includes("r2.dev") || posibleUrl.startsWith("http"))) {
+          const urlLimpiaParaBD = posibleUrl.split("?")[0];
+          const publicIdExistente =
+            PUBLIC_DOMAIN && urlLimpiaParaBD.includes(PUBLIC_DOMAIN)
+              ? urlLimpiaParaBD.replace(`${PUBLIC_DOMAIN}/`, "")
+              : null;
+          fotosYaSubidas.push([id_nueva_ocurrencia, urlLimpiaParaBD, publicIdExistente]);
+        } else {
+          fotosPendientesSubir.push(f);
+        }
+      }
+
+      if (fotosYaSubidas.length > 0) {
+        await connection.query(
+          "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES ?",
+          [fotosYaSubidas]
+        );
+      }
+    }
+
+    
+    
+    await connection.commit();
+    ocurrenciasCacheVersion++;
     res.status(201).json({ success: true, id: id_nueva_ocurrencia });
 
-    // =========================================================
-    // PROCESAR Y SUBIR FOTOS EN SEGUNDO PLANO
-    // =========================================================
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db, id_modalidad).catch(
-        (err) => {
-          console.error(
-            "🔴 Error crítico general en segundo plano de fotos:",
-            err.message,
-          );
-        },
-      );
+    if (fotosPendientesSubir.length > 0) {
+      procesarYSubirFotosSegundoPlano(
+        id_nueva_ocurrencia,
+        fotosPendientesSubir,
+        db,
+        id_modalidad,
+        fecha_evento
+      ).catch((err) => {
+        console.error("🔴 Error crítico general en segundo plano de fotos:", err.message);
+      });
     }
   } catch (error) {
-    if (connection) await connection.rollback();
-    console.error("🔴 ERROR:", error.message);
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rbErr) {
+        console.error("🔴 Error en rollback:", rbErr.message);
+      }
+    }
+    console.error("🔴 ERROR EN REGISTRO:", error.message);
     if (!res.headersSent) {
-      res.status(400).json({ success: false, error: error.message });
+      res.status(500).json({ success: false, error: "No se pudo registrar la ocurrencia." });
     }
   } finally {
     if (connection) connection.release();
   }
 });
+
+// ==========================================
+// 2. ENDPOINT INDIVIDUAL DE SUBIDA DE FOTO ADJUNTA
+// ==========================================
+app.post("/ocurrencias/subir-foto-adjunta", upload.single("foto"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "No se envió ninguna foto." });
+    }
+
+    const { id_modalidad, fecha_evento } = req.body || {};
+    let { anio, mes, dia } = obtenerFechaHoraPeru();
+
+    if (fecha_evento && /^\d{4}-\d{2}-\d{2}$/.test(fecha_evento)) {
+      [anio, mes, dia] = fecha_evento.split("-");
+    }
+
+    const timestamp = Date.now();
+    const randomId = crypto.randomBytes(4).toString("hex");
+    const carpetaModalidad = id_modalidad
+      ? String(id_modalidad).replace(/[^a-zA-Z0-9_-]/g, "")
+      : "sin_modalidad";
+    const nombreArchivo = `ocurrencias/modalidad_${carpetaModalidad}/${anio}/${mes}/${dia}/foto_${timestamp}_${randomId}.jpg`;
+
+    await r2Client.send(
+      new PutObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: nombreArchivo,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype || "image/jpeg",
+      })
+    );
+
+    return res.json({
+      success: true,
+      url_imagen: `${PUBLIC_DOMAIN}/${nombreArchivo}`,
+      public_id: nombreArchivo,
+    });
+  } catch (error) {
+    console.error("🔴 Error al subir foto adjunta:", error.message);
+    return res.status(500).json({ success: false, error: "Error interno al subir la imagen." });
+  } finally {
+    if (req.file) req.file.buffer = null; // Libera RAM inmediatamente
+  }
+});
+// ==========================================
+// 3. FUNCIÓN EN SEGUNDO PLANO (PARA LEGACY BASE64)
+// ==========================================
+async function procesarYSubirFotosSegundoPlano(id_ocurrencia, fotos, dbPool, id_modalidad, fecha_evento) {
+  if (!fotos || !Array.isArray(fotos) || fotos.length === 0) return;
+
+  const registrosParaBD = [];
+  let { anio, mes, dia } = obtenerFechaHoraPeru();
+
+  if (fecha_evento && /^\d{4}-\d{2}-\d{2}$/.test(fecha_evento)) {
+    const partes = fecha_evento.split("-");
+    anio = partes[0];
+    mes = partes[1];
+    dia = partes[2];
+  }
+
+  const carpetaModalidad = id_modalidad
+    ? String(id_modalidad).replace(/[^a-zA-Z0-9_-]/g, "")
+    : "sin_modalidad";
+
+  for (const [idx, f] of fotos.entries()) {
+    try {
+      let bufferOriginal = null;
+
+      if (f && f.archivo_real) {
+        if (typeof f.archivo_real.arrayBuffer === "function") {
+          const arrayBuffer = await f.archivo_real.arrayBuffer();
+          bufferOriginal = Buffer.from(arrayBuffer);
+        } else if (Buffer.isBuffer(f.archivo_real)) {
+          bufferOriginal = f.archivo_real;
+        }
+      } else {
+        let base64Data = null;
+        if (typeof f === "string") base64Data = f;
+        else if (f && f.base64_data) base64Data = f.base64_data;
+        else if (f && f.uri) base64Data = f.uri;
+        else if (f && f.url_imagen) base64Data = f.url_imagen;
+
+        if (!base64Data) continue;
+
+        if (typeof base64Data === "string" && (base64Data.includes("r2.dev") || base64Data.startsWith("http"))) {
+          const urlLimpiaParaBD = base64Data.split("?")[0];
+          const publicIdExistente =
+            PUBLIC_DOMAIN && urlLimpiaParaBD.includes(PUBLIC_DOMAIN)
+              ? urlLimpiaParaBD.replace(`${PUBLIC_DOMAIN}/`, "")
+              : null;
+
+          registrosParaBD.push([id_ocurrencia, urlLimpiaParaBD, publicIdExistente]);
+          continue;
+        }
+
+        const base64Clean = base64Data.replace(/^data:image\/\w+;base64,/, "");
+        bufferOriginal = Buffer.from(base64Clean, "base64");
+      }
+
+      if (!bufferOriginal || bufferOriginal.length === 0) continue;
+
+      const bufferOptimizado = await sharp(bufferOriginal)
+        .rotate()
+        .resize({ width: 1200, withoutEnlargement: true })
+        .jpeg({ quality: 75 })
+        .toBuffer();
+
+      const timestamp = Date.now();
+      const randomId = crypto.randomBytes(4).toString("hex");
+      const nombreArchivo = `ocurrencias/modalidad_${carpetaModalidad}/${anio}/${mes}/${dia}/${id_ocurrencia}_${idx}_${timestamp}_${randomId}.jpg`;
+
+      await r2Client.send(
+        new PutObjectCommand({
+          Bucket: BUCKET_NAME,
+          Key: nombreArchivo,
+          Body: bufferOptimizado,
+          ContentType: "image/jpeg",
+        })
+      );
+
+      const urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
+      registrosParaBD.push([id_ocurrencia, urlImagen, nombreArchivo]);
+    } catch (err) {
+      console.error(`🔴 ERROR CRÍTICO EN FOTO [${idx}]:`, err.message);
+    }
+  }
+
+  if (registrosParaBD.length > 0) {
+    await dbPool.query(
+      "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES ?",
+      [registrosParaBD]
+    );
+  }
+}
 
 app.post("/ocurrencias/registrar/modr2paraSEG", async (req, res) => {
   let connection;
@@ -1125,8 +759,8 @@ app.post("/ocurrencias/registrar/modr2paraSEG", async (req, res) => {
       );
     }
 
-    await connection.commit();
-
+  await connection.commit();
+    ocurrenciasCacheVersion++;
     res.status(201).json({ success: true, id: id_nueva_ocurrencia });
 
     if (fotos && Array.isArray(fotos) && fotos.length > 0) {
@@ -1174,44 +808,36 @@ app.post("/ocurrencias/registrar/modr2para", async (req, res) => {
       detalle_llamada,
       agresores_detalle,
       victimas_detalle,
-      datos_importantes, // 👈 NUEVO: Recibe el objeto con los checkboxes y pertenece_muni
-    } = req.body;
+      datos_importantes,
+    } = req.body || {};
+
+    if (!id_usuario || !id_lugar || !id_modalidad || !descripcion || !fecha_evento) {
+      return res.status(400).json({ success: false, error: "Faltan campos obligatorios." });
+    }
 
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-    const fechaActual = new Date();
-    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
-    const fechaPeruObj = new Date(formatoPeru);
+    const { fechaHora: fechaReportePeru } = obtenerFechaHoraPeru();
 
-    const anio = fechaPeruObj.getFullYear();
-    const mes = String(fechaPeruObj.getMonth() + 1).padStart(2, "0");
-    const dia = String(fechaPeruObj.getDate()).padStart(2, "0");
-    const hora = String(fechaPeruObj.getHours()).padStart(2, "0");
-    const minuto = String(fechaPeruObj.getMinutes()).padStart(2, "0");
-    const segundo = String(fechaPeruObj.getSeconds()).padStart(2, "0");
-
-    const fechaReportePeru = `${anio}-${mes}-${dia} ${hora}:${minuto}:${segundo}`;
-
-    // 1. INSERTAR OCURRENCIA PRINCIPAL
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-            descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-            id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
-            id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
-            nombre_punto_gps, referencia, unidad_encargada, 
-            fecha_reporte, fecha_evento, estado, grupo, turno
-        ) VALUES (?, ?, ?, ?, ?, ? ,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      descripcion, hora_alerta, hora_llegada, hora_repliegue, 
+      id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, 
+      id_origen, id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
+      nombre_punto_gps, referencia, unidad_encargada, 
+      fecha_reporte, fecha_evento, estado, grupo, turno
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion,
+      String(descripcion).trim(),
       hora_alerta || null,
       hora_llegada || null,
       hora_repliegue || null,
-      id_lugar,
-      id_usuario,
-      id_modalidad,
-      id_modalidad,
-      id_origen,
+      Number(id_lugar),
+      Number(id_usuario),
+      Number(id_modalidad),
+      Number(id_modalidad),
+      id_origen ? Number(id_origen) : 1,
       id_tipop || null,
       id_modalidadp || null,
       latitud_gps || 0,
@@ -1221,14 +847,13 @@ app.post("/ocurrencias/registrar/modr2para", async (req, res) => {
       unidad_encargada || "SERENAZGO",
       fechaReportePeru,
       fecha_evento,
-      estadoOcurrencia,
-      grupo,
-      turno || null
+      estadoOcurrencia || "PENDIENTE",
+      grupo || null,
+      turno || null,
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
 
-    // 1.1. INSERTAR DATOS IMPORTANTES Y PERTENENCIA MUNICIPAL (NUEVO)
     if (datos_importantes) {
       await connection.query(
         `INSERT INTO detalle_datos_importantes_ocurrencia 
@@ -1246,56 +871,50 @@ app.post("/ocurrencias/registrar/modr2para", async (req, res) => {
       );
     }
 
-    // 2. INSERTAR DETALLE DE CÁMARAS
     if (id_camara) {
-      let idsCam = Array.isArray(id_camara)
+      const idsCam = Array.isArray(id_camara)
         ? id_camara
         : typeof id_camara === "string"
-          ? id_camara.split(",")
-          : [];
-      const idsCamLimpios = idsCam.map((id) => parseInt(id)).filter((id) => !isNaN(id));
+        ? id_camara.split(",")
+        : [];
+      const idsCamLimpios = [...new Set(idsCam.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id)))];
       if (idsCamLimpios.length > 0) {
-        const valuesCamara = idsCamLimpios.map((camId) => [id_nueva_ocurrencia, camId]);
         await connection.query(
           "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
-          [valuesCamara]
+          [idsCamLimpios.map((camId) => [id_nueva_ocurrencia, camId])]
         );
       }
     }
 
-    // 3. INSERTAR PERSONAL DE APOYO
     if (id_personal_ids) {
-      let idsPers = Array.isArray(id_personal_ids)
+      const idsPers = Array.isArray(id_personal_ids)
         ? id_personal_ids
         : typeof id_personal_ids === "string"
-          ? id_personal_ids.split(",")
-          : [];
-      const idsPersLimpios = idsPers.map((id) => parseInt(id)).filter((id) => !isNaN(id));
+        ? id_personal_ids.split(",")
+        : [];
+      const idsPersLimpios = [...new Set(idsPers.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id)))];
       if (idsPersLimpios.length > 0) {
-        const valuesPersonal = idsPersLimpios.map((persId) => [id_nueva_ocurrencia, persId]);
         await connection.query(
           "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
-          [valuesPersonal]
+          [idsPersLimpios.map((persId) => [id_nueva_ocurrencia, persId])]
         );
       }
     }
 
-    // 4. INSERTAR VEHÍCULOS
-    if (vehiculos_detalle && vehiculos_detalle.length > 0) {
+    if (Array.isArray(vehiculos_detalle) && vehiculos_detalle.length > 0) {
       const valuesV = vehiculos_detalle.map((v) => [
         id_nueva_ocurrencia,
         v.id_tipo_vehiculo,
         v.id_unidad,
         v.tipo_asignacion,
-        v.id_pnp,
+        v.id_pnp || null,
       ]);
       await connection.query(
-        `INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?`,
+        "INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?",
         [valuesV]
       );
     }
 
-    // 5. INSERTAR DETALLE DE LLAMADA
     if (detalle_llamada && detalle_llamada.numero_telefono) {
       await connection.query(
         "INSERT INTO detalle_llamada_ocurrencia (id_ocurrencia, numero_telefono, nombre_informante) VALUES (?, ?, ?)",
@@ -1307,8 +926,7 @@ app.post("/ocurrencias/registrar/modr2para", async (req, res) => {
       );
     }
 
-    // 6. INSERTAR AGRESORES
-    if (agresores_detalle && Array.isArray(agresores_detalle) && agresores_detalle.length > 0) {
+    if (Array.isArray(agresores_detalle) && agresores_detalle.length > 0) {
       const valuesAgresores = agresores_detalle.map((a) => [
         id_nueva_ocurrencia,
         a.nombre_agresor || "N.N.",
@@ -1321,263 +939,62 @@ app.post("/ocurrencias/registrar/modr2para", async (req, res) => {
       );
     }
 
-    // 7. INSERTAR VÍCTIMAS (Actualizado con la estructura solicitada)
+    // Batch insert en lugar de for + await
     if (Array.isArray(victimas_detalle) && victimas_detalle.length > 0) {
-      for (const vic of victimas_detalle) {
-        await connection.query(
-          `INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, placa_victima, edad, id_relacion_v) 
-           VALUES (?, ?, ?, ?, ?)`,
-          [
-            id_nueva_ocurrencia,
-            vic.nombre_victima || null,
-            vic.placa_victima || null,
-            vic.edad || null,
-            vic.id_relacion_v || null,
-          ],
-        );
-      }
+      const valuesVictimas = victimas_detalle.map((vic) => [
+        id_nueva_ocurrencia,
+        vic.nombre_victima || null,
+        vic.placa_victima || null,
+        vic.edad || null,
+        vic.id_relacion_v || null,
+      ]);
+      await connection.query(
+        "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, placa_victima, edad, id_relacion_v) VALUES ?",
+        [valuesVictimas]
+      );
     }
 
-    await connection.commit();
+    const { fotosYaSubidas, fotosPendientesSubir } = clasificarFotosRegistro(id_nueva_ocurrencia, fotos);
+    if (fotosYaSubidas.length > 0) {
+      await connection.query(
+        "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES ?",
+        [fotosYaSubidas]
+      );
+    }
 
+await connection.commit();
+    ocurrenciasCacheVersion++;
     res.status(201).json({ success: true, id: id_nueva_ocurrencia });
 
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db, id_modalidad).catch((err) => {
-        console.error("🔴 Error crítico general en segundo plano de fotos:", err.message);
+    if (fotosPendientesSubir.length > 0) {
+      procesarYSubirFotosSegundoPlano(
+        id_nueva_ocurrencia,
+        fotosPendientesSubir,
+        db,
+        id_modalidad,
+        fecha_evento
+      ).catch((err) => {
+        console.error("🔴 Error en segundo plano de fotos (modr2para):", err.message);
       });
     }
   } catch (error) {
-    if (connection) await connection.rollback();
-    console.error("🔴 ERROR:", error.message);
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rbErr) {
+        console.error("🔴 Error en rollback:", rbErr.message);
+      }
+    }
+    console.error("🔴 ERROR EN modr2para:", error.message);
     if (!res.headersSent) {
-      res.status(400).json({ success: false, error: error.message });
+      res.status(500).json({ success: false, error: "Error al registrar la ocurrencia." });
     }
   } finally {
     if (connection) connection.release();
   }
 });
 
-app.post("/ocurrencias/registrar/modr3", async (req, res) => {
-  let connection;
-  try {
-    const {
-      id_usuario,
-      id_lugar,
-      id_modalidad,
-      id_origen,
-      id_camara,
-      id_tipop,
-      id_modalidadp,
-      descripcion,
-      hora_alerta,
-      hora_llegada,
-      hora_repliegue,
-      latitud_gps,
-      longitud_gps,
-      nombre_punto_gps,
-      referencia,
-      unidad_encargada,
-      fecha_evento,
-      grupo,
-      
-      fotos,
-      estadoOcurrencia,
-      vehiculos_detalle,
-      id_personal_ids,
-      detalle_llamada,
-      agresores_detalle,
-      victimas_detalle,
-    } = req.body;
 
-    // 🔍 LOG 1: BODY ENTRANTE COMPLETO
-    console.log("--------------------------------------------------");
-    console.log("📥 [REQ.BODY RECIBIDO]:", JSON.stringify(req.body, null, 2));
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-
-    // 1. INSERTAR OCURRENCIA PRINCIPAL
-    const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-            descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-            id_lugar, id_usuario, id_modalidad, id_origen,
-            id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
-            nombre_punto_gps, referencia, unidad_encargada, 
-            fecha_reporte, fecha_evento, estado, grupo
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)`;
-
-    const paramsOcurrencia = [
-      descripcion,
-      hora_alerta || null,
-      hora_llegada || null,
-      hora_repliegue || null,
-      id_lugar,
-      id_usuario,
-      id_modalidad,
-      id_origen,
-      id_tipop || null,
-      id_modalidadp || null,
-      latitud_gps || 0,
-      longitud_gps || 0,
-      nombre_punto_gps || "",
-      referencia || "",
-      unidad_encargada || "SERENAZGO",
-      fecha_evento,
-      estadoOcurrencia,
-      grupo,
-    ];
-
-    // 🔍 LOG 2: CONSULTA Y PARÁMETROS REALES DE OCURRENCIA
-    console.log("🗄️ [SQL OCURRENCIA]:", sqlOcurrencia);
-    console.log("📌 [PARAMS OCURRENCIA]:", paramsOcurrencia);
-
-    const [resOcurrencia] = await connection.query(sqlOcurrencia, paramsOcurrencia);
-    const id_nueva_ocurrencia = resOcurrencia.insertId;
-
-    // 2. INSERTAR DETALLE DE CÁMARAS
-    if (id_camara) {
-      let idsCam = Array.isArray(id_camara)
-        ? id_camara
-        : typeof id_camara === "string"
-          ? id_camara.split(",")
-          : [];
-      const idsCamLimpios = idsCam
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
-      if (idsCamLimpios.length > 0) {
-        const valuesCamara = idsCamLimpios.map((camId) => [
-          id_nueva_ocurrencia,
-          camId,
-        ]);
-        console.log("📸 [SQL CÁMARAS PARAMS]:", valuesCamara);
-        await connection.query(
-          "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
-          [valuesCamara],
-        );
-      }
-    }
-
-    // 3. INSERTAR PERSONAL DE APOYO
-    if (id_personal_ids) {
-      let idsPers = Array.isArray(id_personal_ids)
-        ? id_personal_ids
-        : typeof id_personal_ids === "string"
-          ? id_personal_ids.split(",")
-          : [];
-      const idsPersLimpios = idsPers
-        .map((id) => parseInt(id))
-        .filter((id) => !isNaN(id));
-      if (idsPersLimpios.length > 0) {
-        const valuesPersonal = idsPersLimpios.map((persId) => [
-          id_nueva_ocurrencia,
-          persId,
-        ]);
-        console.log("👮 [SQL PERSONAL PARAMS]:", valuesPersonal);
-        await connection.query(
-          "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
-          [valuesPersonal],
-        );
-      }
-    }
-
-    // 4. INSERTAR VEHÍCULOS
-    if (vehiculos_detalle && vehiculos_detalle.length > 0) {
-      const valuesV = vehiculos_detalle.map((v) => [
-        id_nueva_ocurrencia,
-        v.id_tipo_vehiculo,
-        v.id_unidad,
-        v.tipo_asignacion,
-        v.id_pnp,
-      ]);
-      console.log("🚗 [SQL VEHÍCULOS PARAMS]:", valuesV);
-      await connection.query(
-        `INSERT INTO ocurrencia_vehiculo_detalle (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp) VALUES ?`,
-        [valuesV],
-      );
-    }
-
-    // 5. INSERTAR DETALLE DE LLAMADA
-    if (detalle_llamada && detalle_llamada.numero_telefono) {
-      console.log("📞 [SQL LLAMADA PARAMS]:", [
-        id_nueva_ocurrencia,
-        detalle_llamada.numero_telefono,
-        detalle_llamada.nombre_informante || "Anónimo",
-      ]);
-      await connection.query(
-        "INSERT INTO detalle_llamada_ocurrencia (id_ocurrencia, numero_telefono, nombre_informante) VALUES (?, ?, ?)",
-        [
-          id_nueva_ocurrencia,
-          detalle_llamada.numero_telefono,
-          detalle_llamada.nombre_informante || "Anónimo",
-        ],
-      );
-    }
-
-    // 6. INSERTAR AGRESORES
-    if (
-      agresores_detalle &&
-      Array.isArray(agresores_detalle) &&
-      agresores_detalle.length > 0
-    ) {
-      const valuesAgresores = agresores_detalle.map((a) => [
-        id_nueva_ocurrencia,
-        a.nombre_agresor || "N.N.",
-        a.id_tipo_vehiculo || null,
-        a.placa_agresor || null,
-      ]);
-      console.log("⚠️ [SQL AGRESORES PARAMS]:", valuesAgresores);
-      await connection.query(
-        "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?",
-        [valuesAgresores],
-      );
-    }
-
-    // 7. INSERTAR VÍCTIMAS
-    if (
-      victimas_detalle &&
-      Array.isArray(victimas_detalle) &&
-      victimas_detalle.length > 0
-    ) {
-      const valuesVictimas = victimas_detalle.map((v) => [
-        id_nueva_ocurrencia,
-        v.nombre_victima || "N.N.",
-        v.id_tipo_vehiculo || null,
-        v.placa_victima || null,
-        v.id_relacion_v || null,
-      ]);
-      console.log("🛡️ [SQL VÍCTIMAS PARAMS]:", valuesVictimas);
-      await connection.query(
-        "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?",
-        [valuesVictimas],
-      );
-    }
-
-    await connection.commit();
-    console.log(`✅ [TRANSACCIÓN EXITOSA] Ocurrencia ID: ${id_nueva_ocurrencia}`);
-    console.log("--------------------------------------------------");
-
-    res.status(201).json({ success: true, id: id_nueva_ocurrencia });
-
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(
-        (err) => {
-          console.error(
-            "🔴 Error crítico general en segundo plano de fotos:",
-            err.message,
-          );
-        },
-      );
-    }
-  } catch (error) {
-    if (connection) await connection.rollback();
-    console.error("🔴 ERROR:", error.message);
-    if (!res.headersSent) {
-      res.status(400).json({ success: false, error: error.message });
-    }
-  } finally {
-    if (connection) connection.release();
-  }
-});
 
 
 // --- 1. LOGIN (ACTUALIZADO SEGÚN TU IMAGEN) ---
@@ -1639,7 +1056,34 @@ app.get("/ocurrencias", async (req, res) => {
 
 // 2. para cmabiar la ontrseñaconst bcrypt = require('bcrypt');
 const bcrypt = require("bcryptjs");
+function clasificarFotosRegistro(id_ocurrencia, fotos) {
+  const fotosYaSubidas = [];
+  const fotosPendientesSubir = [];
 
+  if (!Array.isArray(fotos) || fotos.length === 0) {
+    return { fotosYaSubidas, fotosPendientesSubir };
+  }
+
+  for (const f of fotos) {
+    const posibleUrl =
+      typeof f === "string"
+        ? f
+        : f?.url_imagen || (typeof f?.uri === "string" && f.uri.startsWith("http") ? f.uri : null);
+
+    if (typeof posibleUrl === "string" && (posibleUrl.includes("r2.dev") || posibleUrl.startsWith("http"))) {
+      const urlLimpia = posibleUrl.split("?")[0];
+      const publicId =
+        PUBLIC_DOMAIN && urlLimpia.includes(PUBLIC_DOMAIN)
+          ? urlLimpia.replace(`${PUBLIC_DOMAIN}/`, "")
+          : null;
+      fotosYaSubidas.push([id_ocurrencia, urlLimpia, publicId]);
+    } else {
+      fotosPendientesSubir.push(f);
+    }
+  }
+
+  return { fotosYaSubidas, fotosPendientesSubir };
+}
 // --- LOGIN CON LOGS DE AUDITORÍA ---
 app.post("/loginb", async (req, res) => {
   const { usuario, contrasena } = req.body;
@@ -2068,18 +1512,30 @@ app.get("/personas", async (req, res) => {
   }
 });
 
-// lsitar undiad organica
+let personasCacheVersion = 1;
+
+// ==========================================
+// 1. UNIDADES ORGÁNICAS (CON CACHÉ 15 MIN)
+// ==========================================
 app.get("/unidades", async (req, res) => {
   try {
-    const sql = `
-      SELECT 
-        uo.id_unidad,
-        CONCAT(uo.nombre_unidad, ' (', s.siglasub, ')') AS nombre_unidad
-      FROM unidad_organica AS uo 
-      INNER JOIN subgerencia AS s ON s.id_subgerencia = uo.id_subgerencia
-      ORDER BY uo.nombre_unidad ASC`;
-
-    const [rows] = await db.query(sql);
+    const forceRefresh = req.query.refresh === "true";
+    const rows = await obtenerConCache(
+      "cat_unidades_org",
+      async () => {
+        const sql = `
+          SELECT 
+            uo.id_unidad,
+            CONCAT(uo.nombre_unidad, ' (', s.siglasub, ')') AS nombre_unidad
+          FROM unidad_organica AS uo 
+          INNER JOIN subgerencia AS s ON s.id_subgerencia = uo.id_subgerencia
+          ORDER BY uo.nombre_unidad ASC`;
+        const [r] = await db.query(sql);
+        return r;
+      },
+      CATALOGOS_TTL_MS,
+      forceRefresh
+    );
     res.json(rows);
   } catch (err) {
     console.error("Error al obtener unidades:", err);
@@ -2231,47 +1687,60 @@ app.get("/personastotalseg", async (req, res) => {
 
 app.get("/personastotal", async (req, res) => {
   try {
-    const { q, unidad, regimen, estado, page = 1, export: isExport } = req.query;
+    const {
+      q = "",
+      unidad = "TODOS",
+      regimen = "TODOS",
+      estado = "TODOS",
+      page = 1,
+      export: isExport,
+    } = req.query;
+
+    const qLimpio = String(q).trim();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limit = 20;
-    const offset = (Number(page) - 1) * limit;
+    const offset = (pageNum - 1) * limit;
 
-    let params = [];
-    let where = "WHERE 1=1";
+    const buildQuery = () => {
+      const params = [];
+      let where = "WHERE 1=1";
 
-    // 1. Buscador global
-    if (q && q.trim() !== "") {
-      const terms = q.trim().split(/\s+/);
-      terms.forEach((t) => {
-        where += ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR p.documento_numero LIKE ?)`;
-        const patt = `%${t}%`;
-        params.push(patt, patt, patt, patt);
-      });
-    }
+      if (qLimpio !== "") {
+        const terms = qLimpio.split(/\s+/).slice(0, 5);
+        terms.forEach((t) => {
+          where += ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR p.documento_numero LIKE ?)`;
+          const patt = `%${t}%`;
+          params.push(patt, patt, patt, patt);
+        });
+      }
 
-    // 2. Filtros dinámicos
-    if (regimen && regimen !== "TODOS") {
-      where += ` AND p.regimen = ?`;
-      params.push(regimen);
-    }
+      if (regimen && regimen !== "TODOS") {
+        where += ` AND p.regimen = ?`;
+        params.push(regimen);
+      }
 
-    if (unidad && unidad !== "TODOS") {
-      where += ` AND p.id_unidad = ?`;
-      params.push(unidad);
-    }
+      if (unidad && unidad !== "TODOS") {
+        where += ` AND p.id_unidad = ?`;
+        params.push(unidad);
+      }
 
-    if (estado && estado !== "TODOS") {
-      where += ` AND p.estado_laboral = ?`;
-      params.push(estado);
-    }
+      if (estado && estado !== "TODOS") {
+        where += ` AND p.estado_laboral = ?`;
+        params.push(estado);
+      }
 
-    // Exportación a Excel completa
+      return { where, params };
+    };
+
+    // Exportación Excel (sin caché, límite de seguridad para proteger RAM de 512MB)
     if (isExport === "true") {
+      const { where, params } = buildQuery();
       const sqlExport = `
         SELECT 
           p.*, 
           uo.nombre_unidad,
           us.usuario,
-          us.id_rol, -- 👈 AGREGADO AQUÍ
+          us.id_rol,
           sr.nombre_rol,
           sr.descripcion as descripcion_rol
         FROM persona p 
@@ -2279,56 +1748,70 @@ app.get("/personastotal", async (req, res) => {
         LEFT JOIN usuarios_sistema us ON p.id_persona = us.id_persona
         LEFT JOIN sistema_roles sr ON us.id_rol = sr.id_rol
         ${where} 
-        ORDER BY p.apellido_paterno ASC`;
+        ORDER BY p.apellido_paterno ASC
+        LIMIT 5000`;
 
       const [exportResults] = await db.query(sqlExport, params);
       return res.json({ data: exportResults });
     }
 
-    // 3. Consulta estándar con paginación
-    const sqlData = `
-      SELECT 
-        p.*, 
-        uo.nombre_unidad,
-        us.usuario,
-        us.id_rol, -- 👈 AGREGADO AQUÍ: Trae el id_rol de usuarios_sistema
-        sr.nombre_rol,
-        sr.descripcion as descripcion_rol
-      FROM persona p 
-      LEFT JOIN unidad_organica uo ON p.id_unidad = uo.id_unidad 
-      LEFT JOIN usuarios_sistema us ON p.id_persona = us.id_persona
-      LEFT JOIN sistema_roles sr ON us.id_rol = sr.id_rol
-      ${where} 
-      ORDER BY p.id_persona DESC 
-      LIMIT ? OFFSET ?`;
+    const fetchPaginado = async () => {
+      const { where, params } = buildQuery();
 
-    const sqlCounts = `
-      SELECT 
-        COUNT(*) as total,
-        COUNT(CASE WHEN p.estado_laboral = 'ACTIVO' THEN 1 END) as activos,
-        COUNT(CASE WHEN p.estado_laboral = 'INACTIVO' THEN 1 END) as inactivos
-      FROM persona p
-      ${where}`;
+      const sqlData = `
+        SELECT 
+          p.*, 
+          uo.nombre_unidad,
+          us.usuario,
+          us.id_rol,
+          sr.nombre_rol,
+          sr.descripcion as descripcion_rol
+        FROM persona p 
+        LEFT JOIN unidad_organica uo ON p.id_unidad = uo.id_unidad 
+        LEFT JOIN usuarios_sistema us ON p.id_persona = us.id_persona
+        LEFT JOIN sistema_roles sr ON us.id_rol = sr.id_rol
+        ${where} 
+        ORDER BY p.id_persona DESC 
+        LIMIT ? OFFSET ?`;
 
-    // Ejecución paralela
-    const [[results], [countsData]] = await Promise.all([
-      db.query(sqlData, [...params, limit, offset]),
-      db.query(sqlCounts, params),
-    ]);
+      const sqlCounts = `
+        SELECT 
+          COUNT(*) as total,
+          COUNT(CASE WHEN p.estado_laboral = 'ACTIVO' THEN 1 END) as activos,
+          COUNT(CASE WHEN p.estado_laboral = 'INACTIVO' THEN 1 END) as inactivos
+        FROM persona p
+        ${where}`;
 
-    const totalRecords = countsData[0]?.total || 0;
+      const [[results], [countsData]] = await Promise.all([
+        db.query(sqlData, [...params, limit, offset]),
+        db.query(sqlCounts, params),
+      ]);
 
-    res.json({
-      data: results,
-      counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
-      pagination: {
-        currentPage: Number(page),
-        limit,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        hasMore: offset + results.length < totalRecords,
-      },
-    });
+      const totalRecords = countsData[0]?.total || 0;
+
+      return {
+        data: results,
+        counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
+        pagination: {
+          currentPage: pageNum,
+          limit,
+          totalRecords,
+          totalPages: Math.ceil(totalRecords / limit),
+          hasMore: offset + results.length < totalRecords,
+        },
+      };
+    };
+
+    // Si no hay texto de búsqueda libre, cacheamos 60s para absorber picos de 500 usuarios
+    // sin contaminar catalogosCache con búsquedas arbitrarias.
+    if (qLimpio === "") {
+      const cacheKey = `personas_v${personasCacheVersion}_${regimen}_${estado}_${unidad}_p${pageNum}`;
+      const respuesta = await obtenerConCache(cacheKey, fetchPaginado, 60 * 1000);
+      return res.json(respuesta);
+    }
+
+    const respuesta = await fetchPaginado();
+    return res.json(respuesta);
   } catch (err) {
     console.error("Error en /personastotal:", err);
     res.status(500).json({ error: err.message });
@@ -3324,9 +2807,8 @@ app.put("/admin/reset-passwordseg/:id_persona", async (req, res) => {
 app.put("/admin/reset-password/:id_persona", async (req, res) => {
   try {
     const { id_persona } = req.params;
-    const { id_rol, nuevaClave, contrasena, acceso_habilitado } = req.body;
+    const { id_rol, nuevaClave, contrasena, acceso_habilitado } = req.body || {};
 
-    // 1. Extraer y validar la contraseña (si se envió)
     const passwordInput = nuevaClave || contrasena;
     const tieneNuevaClave = passwordInput && String(passwordInput).trim().length > 0;
 
@@ -3334,31 +2816,29 @@ app.put("/admin/reset-password/:id_persona", async (req, res) => {
       return res.status(400).json({ error: "La contraseña debe tener al menos 4 caracteres." });
     }
 
-    // 2. Construir la consulta dinámicamente solo con los campos enviados
     const updates = [];
     const values = [];
 
     if (tieneNuevaClave) {
+      const hash = await bcrypt.hash(String(passwordInput).trim(), 10);
       updates.push("contrasena = ?");
-      values.push(String(passwordInput).trim());
+      values.push(hash);
     }
 
-    if (id_rol !== undefined && id_rol !== null) {
+    if (id_rol !== undefined && id_rol !== null && id_rol !== "") {
       updates.push("id_rol = ?");
-      values.push(id_rol);
+      values.push(Number(id_rol));
     }
 
     if (acceso_habilitado !== undefined && acceso_habilitado !== null) {
       updates.push("acceso_habilitado = ?");
-      values.push(acceso_habilitado);
+      values.push(Number(acceso_habilitado));
     }
 
-    // Si no enviaron ningún campo para modificar
     if (updates.length === 0) {
       return res.status(400).json({ error: "No se envió ningún dato para actualizar." });
     }
 
-    // Agregar id_persona al final del arreglo de parámetros SQL
     values.push(id_persona);
 
     const query = `UPDATE usuarios_sistema SET ${updates.join(", ")} WHERE id_persona = ?`;
@@ -3368,6 +2848,7 @@ app.put("/admin/reset-password/:id_persona", async (req, res) => {
       return res.status(404).json({ error: "El usuario no tiene una cuenta de sistema vinculada." });
     }
 
+    personasCacheVersion++;
     res.json({ message: "Datos actualizados con éxito." });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3377,8 +2858,17 @@ app.put("/admin/reset-password/:id_persona", async (req, res) => {
 // Obtener todos los roles disponibles
 app.get("/admin/roles", async (req, res) => {
   try {
-    const [roles] = await db.query(
-      "SELECT id_rol, nombre_rol, descripcion FROM sistema_roles"
+    const forceRefresh = req.query.refresh === "true";
+    const roles = await obtenerConCache(
+      "cat_admin_roles",
+      async () => {
+        const [r] = await db.query(
+          "SELECT id_rol, nombre_rol, descripcion FROM sistema_roles ORDER BY nombre_rol ASC"
+        );
+        return r;
+      },
+      CATALOGOS_TTL_MS,
+      forceRefresh
     );
     res.json(roles);
   } catch (err) {
@@ -3445,42 +2935,67 @@ app.get("/personas3", async (req, res) => {
 // B. Insertar nueva persona
 app.post("/insertpersonas", async (req, res) => {
   try {
-    // Extraemos solo los campos necesarios del cuerpo de la petición
-    // Los campos id_unidad, id_superior, id_grupo, celular y foto_perfil
-    // se reciben pero pueden ser opcionales (vienen como null si no se envían)
     const {
       nombres,
       apellido_paterno,
       apellido_materno,
       documento_numero,
-      id_unidad = 26,
+      id_unidad,
       id_superior = null,
       id_grupo = null,
-      
       foto_perfil = null,
-    } = req.body;
+    } = req.body || {};
 
-    // SQL Simplificado:
-    // No incluimos id_persona porque es NULL/Autoincremental.
-    // No incluimos estado_laboral ni regimen porque mencionas que ya tienen DEFAULT en SQL.
+    if (!nombres?.trim() || !apellido_paterno?.trim() || !documento_numero?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Nombres, apellido paterno y documento son obligatorios.",
+      });
+    }
+
+    const dniLimpio = String(documento_numero).trim();
+    const unidadFinal =
+      id_unidad !== undefined && id_unidad !== null && String(id_unidad).trim() !== ""
+        ? Number(id_unidad)
+        : 26;
+
+    if (Number.isNaN(unidadFinal)) {
+      return res.status(400).json({
+        success: false,
+        message: "Unidad orgánica inválida.",
+      });
+    }
+
+    const [existente] = await db.query(
+      "SELECT id_persona FROM persona WHERE documento_numero = ? LIMIT 1",
+      [dniLimpio]
+    );
+    if (existente.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: "El DNI ya se encuentra registrado en el sistema.",
+      });
+    }
+
     const sql = `
-            INSERT INTO persona 
-            (nombres, apellido_paterno, apellido_materno, documento_numero, 
-             id_unidad, id_superior, id_grupo, foto_perfil) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `;
+      INSERT INTO persona 
+      (nombres, apellido_paterno, apellido_materno, documento_numero, 
+       id_unidad, id_superior, id_grupo, foto_perfil) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
 
     const [result] = await db.query(sql, [
-      nombres?.toUpperCase().trim(),
-      apellido_paterno?.toUpperCase().trim(),
-      apellido_materno?.toUpperCase().trim(),
-      documento_numero,
-      id_unidad,
+      nombres.toUpperCase().trim(),
+      apellido_paterno.toUpperCase().trim(),
+      apellido_materno ? apellido_materno.toUpperCase().trim() : "",
+      dniLimpio,
+      unidadFinal,
       id_superior,
       id_grupo,
-      
       foto_perfil,
     ]);
+
+    personasCacheVersion++;
 
     res.status(201).json({
       success: true,
@@ -3496,6 +3011,7 @@ app.post("/insertpersonas", async (req, res) => {
     });
   }
 });
+
 
 
 // C. Actualizar estado (Para el componente Switch / Slicer)
@@ -3599,6 +3115,8 @@ app.put("/updatepersonaseg/:id", async (req, res) => {
 });
 app.put("/updatepersona/:id", async (req, res) => {
   let connection;
+  let keySubidaR2 = null;
+
   try {
     const { id } = req.params;
     const {
@@ -3614,12 +3132,19 @@ app.put("/updatepersona/:id", async (req, res) => {
       foto_perfil_base64,
       correo,
       genero,
-    } = req.body;
+    } = req.body || {};
 
-    // 1. VALIDACIÓN DE DNI DUPLICADO
+    if (!nombres?.trim() || !apellido_paterno?.trim() || !documento_numero?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Nombres, apellido paterno y DNI son obligatorios.",
+      });
+    }
+
+    // 1. Validar DNI duplicado
     const [existing] = await db.query(
-      "SELECT id_persona FROM persona WHERE documento_numero = ? AND id_persona <> ?",
-      [documento_numero, id]
+      "SELECT id_persona FROM persona WHERE documento_numero = ? AND id_persona <> ? LIMIT 1",
+      [String(documento_numero).trim(), id]
     );
 
     if (existing.length > 0) {
@@ -3629,30 +3154,23 @@ app.put("/updatepersona/:id", async (req, res) => {
       });
     }
 
-    connection = await db.getConnection();
-    await connection.beginTransaction();
+    // 2. Subir foto a R2 ANTES de abrir la conexión/transacción MySQL
+    let final_foto_url = req.body?.foto_perfil || null;
 
-    // 2. MANEJO Y SUBIDA DE FOTO A CLOUDFLARE R2
-    let final_foto_url = req.body.foto_perfil;
-
-    if (foto_perfil_base64 && foto_perfil_base64.includes("base64")) {
-      // Clean header Base64 -> Buffer
+    if (foto_perfil_base64 && typeof foto_perfil_base64 === "string" && foto_perfil_base64.includes("base64")) {
       const base64Clean = foto_perfil_base64.replace(/^data:image\/\w+;base64,/, "");
       const bufferOriginal = Buffer.from(base64Clean, "base64");
 
-      // Comprimir / Redimensionar con Sharp
       const bufferOptimizado = await sharp(bufferOriginal)
+        .rotate()
         .resize({ width: 1200, withoutEnlargement: true })
         .jpeg({ quality: 75 })
         .toBuffer();
 
-      // Generar nombre único para R2
-      const fechaActual = new Date();
-      const anio = fechaActual.getFullYear();
-      const mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
-      const nombreArchivo = `perfiles/${anio}/${mes}/persona_${id}_${Date.now()}.jpg`;
+      const { anio, mes } = obtenerFechaHoraPeru();
+      const randomId = crypto.randomBytes(4).toString("hex");
+      const nombreArchivo = `perfiles/${anio}/${mes}/persona_${id}_${Date.now()}_${randomId}.jpg`;
 
-      // Subir a Cloudflare R2
       await r2Client.send(
         new PutObjectCommand({
           Bucket: BUCKET_NAME,
@@ -3662,11 +3180,14 @@ app.put("/updatepersona/:id", async (req, res) => {
         })
       );
 
-      // URL final generada
+      keySubidaR2 = nombreArchivo;
       final_foto_url = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
     }
 
-    // 3. UPDATE Principal
+    // 3. Transacción MySQL rápida
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
     const sqlUpdate = `
       UPDATE persona SET 
         nombres = ?, apellido_paterno = ?, apellido_materno = ?, 
@@ -3676,23 +3197,30 @@ app.put("/updatepersona/:id", async (req, res) => {
       WHERE id_persona = ?
     `;
 
-    await connection.query(sqlUpdate, [
-      nombres?.toUpperCase().trim(),
-      apellido_paterno?.toUpperCase().trim(),
-      apellido_materno?.toUpperCase().trim(),
-      documento_numero,
-      estado_laboral,
-      id_unidad,
-      id_grupo,
-      regimen,
-      celular,
+    const [updateRes] = await connection.query(sqlUpdate, [
+      nombres.toUpperCase().trim(),
+      apellido_paterno.toUpperCase().trim(),
+      apellido_materno ? apellido_materno.toUpperCase().trim() : "",
+      String(documento_numero).trim(),
+      estado_laboral || "ACTIVO",
+      id_unidad ? Number(id_unidad) : null,
+      id_grupo || null,
+      regimen || "LOCADOR",
+      celular || null,
       final_foto_url,
-      correo?.toLowerCase().trim() || null,
-      genero?.toUpperCase().trim() || null,
+      correo ? correo.toLowerCase().trim() : null,
+      genero ? genero.toUpperCase().trim() : null,
       id,
     ]);
 
-    // Obtener el nombre de la unidad vinculada
+    if (updateRes.affectedRows === 0) {
+      await connection.rollback();
+      if (keySubidaR2) {
+        r2Client.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: keySubidaR2 })).catch(() => {});
+      }
+      return res.status(404).json({ success: false, message: "Trabajador no encontrado." });
+    }
+
     const [rows] = await connection.query(
       `SELECT u.nombre_unidad 
        FROM persona as p 
@@ -3702,6 +3230,7 @@ app.put("/updatepersona/:id", async (req, res) => {
     );
 
     await connection.commit();
+    personasCacheVersion++;
 
     res.json({
       success: true,
@@ -3709,7 +3238,13 @@ app.put("/updatepersona/:id", async (req, res) => {
       foto_url: final_foto_url,
     });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    // Limpia archivo huérfano en R2 si falló MySQL
+    if (keySubidaR2) {
+      r2Client.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: keySubidaR2 })).catch(() => {});
+    }
     res.status(500).json({ success: false, error: error.message });
   } finally {
     if (connection) connection.release();
@@ -5138,63 +4673,123 @@ app.get("/catalogos/completo/camna", async (req, res) => {
 
 // --- 2. ENDPOINT PARA VÍAS (Depende de Tipo de Vía) ---
 app.get("/catalogos/vias/:idTipoVia", async (req, res) => {
-  let connection;
   try {
     const { idTipoVia } = req.params;
+    const idNum = Number(idTipoVia);
 
-    // Si envían el id 11, devolvemos un arreglo vacío inmediatamente
-    if (Number(idTipoVia) === 11) {
+    // Si es 11 o 13, responde vacío inmediatamente
+    if (idNum === 11 || idNum === 13) {
       return res.json([]);
     }
 
-    connection = await db.getConnection();
-    const [rows] = await connection.query(
-      "SELECT id_via AS value, nombre_via AS label FROM via WHERE id_tipo_via = ? ORDER BY nombre_via ASC",
-      [idTipoVia],
-    );
+    const rows = await obtenerConCache(`cat_vias_${idNum}`, async () => {
+      const [r] = await db.query(
+        "SELECT id_via AS value, nombre_via AS label FROM via WHERE id_tipo_via = ? AND (estado = 1 OR estado IS NULL) ORDER BY nombre_via ASC",
+        [idNum]
+      );
+      return r;
+    });
+
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
-  } finally {
-    if (connection) connection.release();
   }
 });
 
 // --- 3. ENDPOINT PARA CUADRAS (Depende de Vía - Retorna id_lugar) ---
 app.get("/catalogos/cuadras/:idVia", async (req, res) => {
-  let connection;
   try {
     const { idVia } = req.params;
-    // Si envían tipoLugar por query param lo usa, si no, busca todos los registros asociados a la vía
-    const { tipoLugar } = req.query; 
+    const { tipoLugar } = req.query;
+    const cacheKey = `cat_cuadras_${idVia}_${tipoLugar || "all"}`;
 
-    connection = await db.getConnection();
+    const rows = await obtenerConCache(cacheKey, async () => {
+      let sql = `
+        SELECT 
+          l.id_lugar AS value, 
+          CONCAT('CDRA. ', c.numero_cuadra) AS label 
+        FROM lugar l
+        INNER JOIN cuadra c ON l.id_cuadra = c.id_cuadra
+        WHERE l.id_via = ?
+      `;
+      const params = [idVia];
+      if (tipoLugar) {
+        sql += ` AND l.id_tipo_lugar = ?`;
+        params.push(tipoLugar);
+      }
+      sql += ` ORDER BY CAST(c.numero_cuadra AS UNSIGNED) ASC`;
 
-    let sql = `
-      SELECT 
-        l.id_lugar AS value, 
-        CONCAT('CDRA. ', c.numero_cuadra) AS label 
-      FROM lugar l
-      INNER JOIN cuadra c ON l.id_cuadra = c.id_cuadra
-      WHERE l.id_via = ?
-    `;
-
-    const params = [idVia];
-
-    // Solo filtra por tipoLugar si te lo envían explícitamente en la URL
-    if (tipoLugar) {
-      sql += ` AND l.id_tipo_lugar = ?`;
-      params.push(tipoLugar);
-    }
-
-    sql += ` ORDER BY CAST(c.numero_cuadra AS UNSIGNED) ASC`;
-
-    const [rows] = await connection.query(sql, params);
+      const [r] = await db.query(sql, params);
+      return r;
+    });
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
-  } finally {
-    if (connection) connection.release();
+  }
+});
+// --- ENDPOINT PARA LUGARES POR VÍA (USO GENERAL / OTRO MÓDULO) ---
+// --- ENDPOINT PARA LUGARES POR VÍA Y TIPO ---
+// --- ENDPOINT PARA LUGARES POR VÍA (DEVUELVE TODO O FILTRA POR TIPO) ---
+// Asegúrate de tener este endpoint en tu backend de Node.js
+app.get("/catalogos/tipos-lugar", async (req, res) => {
+  try {
+    const rows = await obtenerConCache("cat_tipos_lugar", async () => {
+      const [r] = await db.query(
+        "SELECT id_tipo AS value, nombre_tipo AS label FROM tipos_lugar WHERE id_tipo IN (7, 8, 9, 10) ORDER BY id_tipo ASC"
+      );
+      return r;
+    });
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+// --- ENDPOINT CORREGIDO: LUGARES POR TIPO DE LUGAR (SIN VÍAS) ---
+app.get("/catalogos/lugares-por-tipo/:idTipoLugar", async (req, res) => {
+  try {
+    const { idTipoLugar } = req.params; // Ej: 7, 8, 9 o 10
+    const cacheKey = `cat_lugares_tipo_${idTipoLugar}`;
+
+    const rows = await obtenerConCache(cacheKey, async () => {
+      let sql = "";
+      let params = [];
+
+      // Si vienen varios tipos separados por coma (ej: "7,8,9,10")
+      const esMultiple = idTipoLugar && idTipoLugar.includes(',');
+
+      if (esMultiple) {
+        // OPCIÓN 1: Solo el nombre_lugar limpio para los códigos 7, 8, 9, 10
+        const tiposArray = idTipoLugar.split(',').map(t => t.trim());
+        sql = `
+          SELECT 
+            l.id_lugar AS value, 
+            l.nombre_lugar AS label 
+          FROM lugar l
+          WHERE l.id_tipo_lugar IN (${tiposArray.map(() => '?').join(',')})
+          ORDER BY l.nombre_lugar ASC
+        `;
+        params.push(...tiposArray);
+      } else {
+        // OPCIÓN 2: Listar concatenando tipo y lugar para un tipo específico
+        sql = `
+          SELECT 
+            l.id_lugar AS value, 
+            CONCAT(UPPER(tl.nombre_tipo), ' - ', UPPER(l.nombre_lugar)) AS label 
+          FROM lugar l
+          INNER JOIN tipos_lugar tl ON tl.id_tipo = l.id_tipo_lugar
+          WHERE l.id_tipo_lugar = ?
+          ORDER BY l.nombre_lugar ASC
+        `;
+        params.push(idTipoLugar);
+      }
+
+      const [r] = await db.query(sql, params);
+      return r;
+    });
+
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 // --- FIN DE CASCADA ---
@@ -5297,9 +4892,12 @@ app.post("/ocurrencias/registrar/modalidad", async (req, res) => {
 // 1. Obtener tipos de vehículo (para el primer dropdown)
 app.get("/catalogos/tipos-vehiculo", async (req, res) => {
   try {
-    const [rows] = await db.query(
-      "SELECT id_tipo_vehiculo as value, descripcion as label FROM tipo_vehiculo",
-    );
+    const rows = await obtenerConCache("cat_tipos_vehiculo", async () => {
+      const [r] = await db.query(
+        "SELECT id_tipo_vehiculo as value, descripcion as label FROM tipo_vehiculo ORDER BY descripcion ASC"
+      );
+      return r;
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5309,24 +4907,26 @@ app.get("/catalogos/tipos-vehiculo", async (req, res) => {
 
 app.get("/catalogos/radios", async (req, res) => {
   try {
-    // Seleccionamos el id como 'value' y el campo a mostrar como 'label'
-    const [rows] = await db.query(
-      "SELECT id_radio as value, issi_dolphin as label FROM radio",
-    );
+    const rows = await obtenerConCache("cat_radios", async () => {
+      const [r] = await db.query(
+        "SELECT id_radio as value, issi_dolphin as label FROM radio ORDER BY issi_dolphin ASC"
+      );
+      return r;
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-//para jalar zona
-
 app.get("/catalogos/zonas", async (req, res) => {
   try {
-    // Mapeamos el ID a 'value' y la descripción a 'label'
-    const [rows] = await db.query(
-      "SELECT id_zona as value, descripcion as label FROM zona",
-    );
+    const rows = await obtenerConCache("cat_zonas", async () => {
+      const [r] = await db.query(
+        "SELECT id_zona as value, descripcion as label FROM zona ORDER BY descripcion ASC"
+      );
+      return r;
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5336,23 +4936,26 @@ app.get("/catalogos/zonas", async (req, res) => {
 app.get("/catalogos/vehiculos-por-tipo/:idTipo", async (req, res) => {
   try {
     const { idTipo } = req.params;
-    const query = `
-            SELECT 
-                numero_unidad,
-                id_unidad as value, 
-                CONCAT(placa, ' (N° ', numero_unidad, ')') as label 
-            FROM sipcop_flota_municipal 
-            WHERE id_tipo_vehiculo = ? 
-            AND estado = 1
-        `;
-
-    const [rows] = await db.query(query, [idTipo]);
+    const rows = await obtenerConCache(`cat_vehiculos_tipo_${idTipo}`, async () => {
+      const [r] = await db.query(
+        `SELECT 
+          numero_unidad,
+          id_unidad as value, 
+          CONCAT(placa, ' (N° ', numero_unidad, ')') as label 
+         FROM sipcop_flota_municipal 
+         WHERE id_tipo_vehiculo = ? AND estado = 1
+         ORDER BY numero_unidad ASC`,
+        [idTipo]
+      );
+      return r;
+    });
     res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error al obtener la flota activa" });
   }
 });
+
 
 app.post("/ocurrencias/registrar/veh", async (req, res) => {
   let connection;
@@ -5432,9 +5035,12 @@ app.post("/ocurrencias/registrar/veh", async (req, res) => {
 });
 app.get("/catalogos/pnp-activos", async (req, res) => {
   try {
-    const [rows] = await db.query(
-      "SELECT id_pnp as value, CONCAT(apellidos, ', ', nombres) as label FROM cat_pnp WHERE estado = 1",
-    );
+    const rows = await obtenerConCache("cat_pnp_activos", async () => {
+      const [r] = await db.query(
+        "SELECT id_pnp as value, CONCAT(apellidos, ', ', nombres) as label FROM cat_pnp WHERE estado = 1 ORDER BY apellidos ASC"
+      );
+      return r;
+    });
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -6615,429 +6221,340 @@ app.put("/ocurrencias/editarseg3/:id_ocurrencia", async (req, res) => {
 
 app.put("/ocurrencias/editar/:id_ocurrencia", async (req, res) => {
   let connection;
+  const keysSubidasR2 = [];
+
   try {
     const {
       fecha_evento,
       nombre_lugar,
+      value: idLugarFrontend,
+      id_lugar: idLugarBody,
       hora_alerta,
       hora_llegada,
       hora_repliegue,
       referencia,
       ocurrencia_descripcion,
       lista_fotos,
-    } = req.body;
+    } = req.body || {};
     const { id_ocurrencia } = req.params;
 
-    connection = await db.getConnection();
-    await connection.beginTransaction();
+    const idLugarDirecto = Number(idLugarBody || idLugarFrontend) || null;
 
-    // 1. Actualizar los datos principales de la ocurrencia
-    await connection.query(
-      `
-            UPDATE ocurrencia_registro 
-            SET fecha_evento = ?, 
-                id_lugar = (SELECT id_lugar FROM lugar WHERE nombre_lugar = ? LIMIT 1),
-                hora_alerta = ?, 
-                hora_llegada = ?, 
-                hora_repliegue = ?, 
-                referencia = ?, 
-                descripcion = ?
-            WHERE id_ocurrencia = ?`,
-      [
-        fecha_evento,
-        nombre_lugar,
-        hora_alerta,
-        hora_llegada,
-        hora_repliegue,
-        referencia,
-        ocurrencia_descripcion,
-        id_ocurrencia,
-      ],
-    );
+    // Procesar y subir nuevas fotos a R2 ANTES de abrir conexión MySQL
+    const valoresFotos = [];
+    if (Array.isArray(lista_fotos)) {
+      const { anio, mes } = obtenerFechaHoraPeru();
 
-    // 2. Limpiar las fotos anteriores de MySQL para refrescar la lista completa
-    await connection.query(
-      `DELETE FROM foto_ocurrencia_registro WHERE id_ocurrencia = ?`,
-      [id_ocurrencia],
-    );
+      for (const [idx, foto] of lista_fotos.entries()) {
+        let urlImagen = typeof foto === "string" ? foto : foto?.url_imagen || foto?.url;
+        let publicId = foto?.public_id || null;
 
-    // 3. Procesar la nueva lista de fotos (tanto las existentes como las nuevas en Base64)
-    if (Array.isArray(lista_fotos) && lista_fotos.length > 0) {
-      const valoresFotos = [];
+        if (!urlImagen || urlImagen === "null") continue;
 
-      for (let [idx, foto] of lista_fotos.entries()) {
-        let urlImagen =
-          typeof foto === "string" ? foto : foto.url_imagen || foto.url;
-        let publicId = foto.public_id || null;
-
-        // SI LA FOTO ES NUEVA (Viene en formato Base64 desde el FileReader web o móvil)
-        if (urlImagen && urlImagen.startsWith("data:image")) {
+        if (urlImagen.startsWith("data:image")) {
           try {
-            // Remueve cualquier encabezado data URI independientemente del formato (png, jpg, webp, etc.)
-const base64Clean = urlImagen.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
+            const base64Clean = urlImagen.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, "");
             const bufferOriginal = Buffer.from(base64Clean, "base64");
 
-            // Optimizar con Sharp
             const bufferOptimizado = await sharp(bufferOriginal)
+              .rotate()
               .resize({ width: 1200, withoutEnlargement: true })
               .jpeg({ quality: 75 })
               .toBuffer();
 
             const timestamp = Date.now();
-            const fechaActual = new Date();
-            const anio = fechaActual.getFullYear();
-            const mes = String(fechaActual.getMonth() + 1).padStart(2, "0");
-            const nombreArchivo = `ocurrencias/${anio}/${mes}/${id_ocurrencia}_edit_${idx}_${timestamp}.jpg`;
+            const randomId = crypto.randomBytes(4).toString("hex");
+            const nombreArchivo = `ocurrencias/${anio}/${mes}/${id_ocurrencia}_edit_${idx}_${timestamp}_${randomId}.jpg`;
 
-            // Subir a Cloudflare R2
             await r2Client.send(
               new PutObjectCommand({
                 Bucket: BUCKET_NAME,
                 Key: nombreArchivo,
                 Body: bufferOptimizado,
                 ContentType: "image/jpeg",
-              }),
+              })
             );
 
+            keysSubidasR2.push(nombreArchivo);
             urlImagen = `${PUBLIC_DOMAIN}/${nombreArchivo}`;
             publicId = nombreArchivo;
           } catch (errSharp) {
-            console.error(
-              `🔴 Error procesando imagen nueva [${idx}]:`,
-              errSharp.message,
-            );
+            console.error(`🔴 Error procesando imagen [${idx}]:`, errSharp.message);
             continue;
           }
         } else {
-          // SI LA FOTO YA EXISTE (Mantiene su URL pública de R2)
-          if (!publicId && urlImagen && urlImagen.includes(PUBLIC_DOMAIN)) {
+          urlImagen = urlImagen.split("?")[0];
+          if (!publicId && PUBLIC_DOMAIN && urlImagen.includes(PUBLIC_DOMAIN)) {
             publicId = urlImagen.replace(`${PUBLIC_DOMAIN}/`, "");
           }
         }
 
         valoresFotos.push([id_ocurrencia, urlImagen, publicId]);
       }
+    }
 
-      // 4. Insertar las fotos actualizadas de golpe en MySQL
+    // Transacción rápida en MySQL
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    await connection.query(
+      `UPDATE ocurrencia_registro 
+       SET fecha_evento = COALESCE(?, fecha_evento),
+           id_lugar = COALESCE(
+             ?,
+             (SELECT id_lugar FROM lugar WHERE nombre_lugar = ? LIMIT 1),
+             id_lugar
+           ),
+           hora_alerta = ?, 
+           hora_llegada = ?, 
+           hora_repliegue = ?, 
+           referencia = ?, 
+           descripcion = ?
+       WHERE id_ocurrencia = ?`,
+      [
+        fecha_evento ? String(fecha_evento).split("T")[0] : null,
+        idLugarDirecto,
+        nombre_lugar ? String(nombre_lugar).trim() : "",
+        hora_alerta || null,
+        hora_llegada || null,
+        hora_repliegue || null,
+        referencia || "",
+        ocurrencia_descripcion || "",
+        id_ocurrencia,
+      ]
+    );
+
+    if (Array.isArray(lista_fotos)) {
+      await connection.query("DELETE FROM foto_ocurrencia_registro WHERE id_ocurrencia = ?", [
+        id_ocurrencia,
+      ]);
+
       if (valoresFotos.length > 0) {
-        const sqlInsertFotos = `
-                    INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) 
-                    VALUES ?`;
-        await connection.query(sqlInsertFotos, [valoresFotos]);
+        await connection.query(
+          "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES ?",
+          [valoresFotos]
+        );
       }
     }
 
     await connection.commit();
+    ocurrenciasCacheVersion++;
+
     res.status(200).json({
       success: true,
       message: "Ocurrencia y fotos actualizadas correctamente",
     });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    for (const key of keysSubidasR2) {
+      r2Client.send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key })).catch(() => {});
+    }
     console.error("🔴 ERROR AL EDITAR OCURRENCIA:", error.message);
-    res.status(400).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar el registro." });
   } finally {
     if (connection) connection.release();
   }
 });
 
-app.get("/catalogos/completo/unificado", async (req, res) => {
-  let connection;
-  // Extraemos el tipo de vía si viene en el query (para la carga de lugares)
-  const { tipoLugar } = req.query;
-
-  try {
-    connection = await db.getConnection();
-
-    // Definimos las consultas base que siempre se ejecutan
-    const queries = [
-      connection.query(
-        "SELECT id AS value, nombre AS label FROM cat_modalidad ORDER BY nombre",
-      ),
-      connection.query(`
-                SELECT u.id_usuario AS value, 
-                CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS label 
-                FROM usuarios_sistema u 
-                INNER JOIN persona p ON u.id_usuario = p.id_persona
-                WHERE p.estado_laboral = 'ACTIVO'
-                ORDER BY p.apellido_paterno, p.nombres
-            `),
-      connection.query(
-        "SELECT id_origen AS value, descripcion AS label FROM origen ORDER BY descripcion",
-      ),
-      connection.query(
-        'SELECT id_camara AS value, CONCAT(codigo_camara, " - ", nombre_camara) AS label FROM camara ORDER BY codigo_camara ASC',
-      ),
-      connection.query(
-        "SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje ORDER BY nombre",
-      ),
-      connection.query(
-        "SELECT id_modalidadp AS value, nombre AS label FROM modalidad_patrullaje ORDER BY nombre",
-      ),
-      connection.query(
-        "SELECT id_tipo_via AS value, abreviatura AS label FROM tipo_via ORDER BY abreviatura ASC",
-      ),
-    ];
-
-    // Si tipoLugar está presente, añadimos la consulta de lugares al array de promesas
-    if (tipoLugar) {
-      queries.push(
-        connection.query(
-          `
-                    SELECT 
-                        l.id_lugar AS value, 
-                        CONCAT(tv.abreviatura, ' ', v.nombre_via, ' CDRA. ', c.numero_cuadra) AS label 
-                    FROM lugar l
-                    INNER JOIN cuadra c ON l.id_cuadra = c.id_cuadra
-                    INNER JOIN via v ON l.id_via = v.id_via
-                    INNER JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
-                    WHERE l.id_tipo_lugar = ?
-                    ORDER BY v.nombre_via ASC, c.numero_cuadra ASC
-                `,
-          [tipoLugar],
-        ),
-      );
-    }
-
-    const results = await Promise.all(queries);
-
-    // Mapeo de resultados
-    const response = {
-      modalidades: results[0][0],
-      usuarios: results[1][0],
-      origenes: results[2][0],
-      camaras: results[3][0],
-      tipos_patrullaje: results[4][0],
-      modalidades_patrullaje: results[5][0],
-      tipos_via: results[6][0],
-    };
-
-    // Si se consultaron lugares, se agregan al objeto final
-    if (tipoLugar) {
-      response.lugares = results[7][0];
-    }
-
-    res.json(response);
-  } catch (error) {
-    console.error("Error al cargar catálogos consolidados:", error);
-    res.status(500).json({ error: "Error interno al cargar catálogos" });
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-app.get("/catalogos/completo/unificadof", async (req, res) => {
-  let connection;
-  // Extraemos tipoLugar e idTipoP de la URL
-  // Ejemplo: /catalogos/completo/unificado?tipoLugar=2&idTipoP=1
-  const { tipoLugar, idTipoP } = req.query;
-
-  try {
-    connection = await db.getConnection();
-
-    // Definimos las consultas base
-    const queries = [
-      connection.query(
-        "SELECT id AS value, nombre AS label FROM cat_modalidad ORDER BY nombre",
-      ),
-      connection.query(`
-                SELECT u.id_usuario AS value, 
-                CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS label 
-                FROM usuarios_sistema u 
-                INNER JOIN persona p ON u.id_usuario = p.id_persona
-                WHERE p.estado_laboral = 'ACTIVO'
-                ORDER BY p.apellido_paterno, p.nombres
-            `),
-      connection.query(
-        "SELECT id_origen AS value, descripcion AS label FROM origen ORDER BY descripcion",
-      ),
-      connection.query(
-        'SELECT id_camara AS value, CONCAT(codigo_camara, " - ", nombre_camara) AS label FROM camara ORDER BY codigo_camara ASC',
-      ),
-
-      // MODIFICACIÓN: Consulta dinámica de tipo_patrullaje
-      idTipoP
-        ? connection.query(
-            "SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje WHERE id_tipop IN (?)",
-            [idTipoP],
-          )
-        : connection.query(
-            "SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje ORDER BY nombre",
-          ),
-
-      connection.query(
-        "SELECT id_modalidadp AS value, nombre AS label FROM modalidad_patrullaje ORDER BY nombre",
-      ),
-      connection.query(
-        "SELECT id_tipo_via AS value, abreviatura AS label FROM tipo_via ORDER BY abreviatura ASC",
-      ),
-    ];
-
-    // Consulta de lugares (se mantiene igual)
-    if (tipoLugar) {
-      queries.push(
-        connection.query(
-          `
-                    SELECT 
-                        l.id_lugar AS value, 
-                        CONCAT(tv.abreviatura, ' ', v.nombre_via, ' CDRA. ', c.numero_cuadra) AS label 
-                    FROM lugar l
-                    INNER JOIN cuadra c ON l.id_cuadra = c.id_cuadra
-                    INNER JOIN via v ON l.id_via = v.id_via
-                    INNER JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
-                    WHERE l.id_tipo_lugar = ?
-                    ORDER BY v.nombre_via ASC, c.numero_cuadra ASC
-                `,
-          [tipoLugar],
-        ),
-      );
-    }
-
-    const results = await Promise.all(queries);
-
-    const response = {
-      modalidades: results[0][0],
-      usuarios: results[1][0],
-      origenes: results[2][0],
-      camaras: results[3][0],
-      tipos_patrullaje: results[4][0], // Contendrá solo el ID solicitado o todos si no se envió idTipoP
-      modalidades_patrullaje: results[5][0],
-      tipos_via: results[6][0],
-    };
-
-    if (tipoLugar) {
-      response.lugares = results[7][0];
-    }
-
-    res.json(response);
-  } catch (error) {
-    console.error("Error al cargar catálogos consolidados:", error);
-    res.status(500).json({ error: "Error interno al cargar catálogos" });
-  } finally {
-    if (connection) connection.release();
-  }
-});
 app.get("/catalogos/completo/unificadov", async (req, res) => {
-  let connection;
   const { tipoLugar, idTipoP } = req.query;
 
+  // Soporta comas o parámetros repetidos (?tipoLugar=7,8,9,10 o ?tipoLugar=7&tipoLugar=8)
+  const idsTipoLugar = tipoLugar
+    ? (Array.isArray(tipoLugar) ? tipoLugar.join(",") : String(tipoLugar))
+        .split(",")
+        .map((n) => parseInt(n.trim(), 10))
+        .filter((n) => !Number.isNaN(n))
+    : [];
+
+  const idsTipoP = idTipoP
+    ? (Array.isArray(idTipoP) ? idTipoP.join(",") : String(idTipoP))
+        .split(",")
+        .map((n) => parseInt(n.trim(), 10))
+        .filter((n) => !Number.isNaN(n))
+    : [];
+
+  const cacheKey = `cat_unif_${idsTipoLugar.join(",") || "all"}_${idsTipoP.join(",") || "all"}`;
+
   try {
-    connection = await db.getConnection();
+    const data = await obtenerConCache(cacheKey, async () => {
+      const queries = [
+        db.query("SELECT id AS value, nombre AS label FROM cat_modalidad ORDER BY nombre"),
+        db.query(`
+          SELECT u.id_usuario AS value, 
+            CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS label 
+          FROM usuarios_sistema u 
+          INNER JOIN persona p ON u.id_usuario = p.id_persona
+          WHERE p.estado_laboral = 'ACTIVO'
+          ORDER BY p.apellido_paterno, p.nombres
+        `),
+        db.query("SELECT id_origen AS value, descripcion AS label FROM origen ORDER BY descripcion"),
+        db.query('SELECT id_camara AS value, CONCAT(codigo_camara, " - ", nombre_camara) AS label FROM camara WHERE estado = 1 ORDER BY codigo_camara ASC'),
+        idsTipoP.length > 0
+          ? db.query("SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje WHERE id_tipop IN (?)", [idsTipoP])
+          : db.query("SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje ORDER BY nombre"),
+        db.query("SELECT id_modalidadp AS value, nombre AS label FROM modalidad_patrullaje ORDER BY nombre"),
+      db.query("SELECT id_tipo_via AS value, abreviatura AS label FROM tipo_via WHERE id_tipo_via NOT IN (11, 13) AND (estado = 1 OR estado IS NULL) ORDER BY abreviatura ASC"),
+        db.query(`
+          SELECT 
+            id_persona AS value, 
+            CONCAT(apellido_paterno, ' ', apellido_materno, ', ', nombres) AS label,
+            documento_numero, cargo_operativo, foto_perfil
+          FROM personal_operativo 
+          WHERE estado = 1 
+          ORDER BY apellido_paterno ASC
+        `),
+      ];
 
-    const queries = [
-      connection.query(
-        "SELECT id AS value, nombre AS label FROM cat_modalidad ORDER BY nombre",
-      ),
-      connection.query(`
-                SELECT u.id_usuario AS value, 
-                CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS label 
-                FROM usuarios_sistema u 
-                INNER JOIN persona p ON u.id_usuario = p.id_persona
-                WHERE p.estado_laboral = 'ACTIVO'
-                ORDER BY p.apellido_paterno, p.nombres
-            `),
-      connection.query(
-        "SELECT id_origen AS value, descripcion AS label FROM origen ORDER BY descripcion",
-      ),
-      // 1. Modificamos cámaras para que solo liste las activas (estado 1)
-      connection.query(
-        'SELECT id_camara AS value, CONCAT(codigo_camara, " - ", nombre_camara) AS label FROM camara WHERE estado = 1 ORDER BY codigo_camara ASC',
-      ),
-
-      idTipoP
-        ? connection.query(
-            "SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje WHERE id_tipop IN (?)",
-            [idTipoP],
+      if (idsTipoLugar.length > 0) {
+        queries.push(
+          db.query(
+            `SELECT l.id_lugar AS value, l.nombre_lugar AS label
+             FROM lugar l
+             WHERE l.id_tipo_lugar IN (?)
+             ORDER BY l.nombre_lugar ASC`,
+            [idsTipoLugar]
           )
-        : connection.query(
-            "SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje ORDER BY nombre",
-          ),
+        );
+      }
 
-      connection.query(
-        "SELECT id_modalidadp AS value, nombre AS label FROM modalidad_patrullaje ORDER BY nombre",
-      ),
-      connection.query(
-        "SELECT id_tipo_via AS value, abreviatura AS label FROM tipo_via ORDER BY abreviatura ASC",
-      ),
+      const results = await Promise.all(queries);
 
-      // 2. NUEVA CONSULTA: Listado de Personal Operativo
-      connection.query(`
-                SELECT 
-                    id_persona AS value, 
-                    CONCAT(apellido_paterno, ' ', apellido_materno, ', ', nombres) AS label,
-                    documento_numero,
-                    cargo_operativo,
-                    foto_perfil
-                FROM personal_operativo 
-                WHERE estado = 1 
-                ORDER BY apellido_paterno ASC
-            `),
-    ];
+      const resp = {
+        modalidades: results[0][0],
+        usuarios: results[1][0],
+        origenes: results[2][0],
+        camaras: results[3][0],
+        tipos_patrullaje: results[4][0],
+        modalidades_patrullaje: results[5][0],
+        tipos_via: results[6][0],
+        personal_operativo: results[7][0],
+      };
 
-    if (tipoLugar) {
-      queries.push(
-        connection.query(
-          `
-                    SELECT 
-                        l.id_lugar AS value, 
-                        l.nombre_lugar AS label 
-                    FROM lugar l
-                   
-                    WHERE l.id_tipo_lugar = ?
-                  
-                `,
-          [tipoLugar],
-        ),
-      );
-    }
+      if (idsTipoLugar.length > 0) {
+        resp.lugares = results[8][0];
+      }
 
-    const results = await Promise.all(queries);
+      return resp;
+    });
 
-    const response = {
-      modalidades: results[0][0],
-      usuarios: results[1][0],
-      origenes: results[2][0],
-      camaras: results[3][0],
-      tipos_patrullaje: results[4][0],
-      modalidades_patrullaje: results[5][0],
-      tipos_via: results[6][0],
-      // 3. Agregamos el resultado a la respuesta JSON
-      personal_operativo: results[7][0],
-    };
-
-    if (tipoLugar) {
-      response.lugares = results[8][0]; // El índice cambia a 8 porque agregamos uno antes
-    }
-
-    res.json(response);
+    res.json(data);
   } catch (error) {
-    console.error("Error al cargar catálogos consolidados:", error);
+    console.error("Error catálogos unificados:", error);
     res.status(500).json({ error: "Error interno al cargar catálogos" });
-  } finally {
-    if (connection) connection.release();
   }
 });
+
+app.get("/catalogos/completo/lugarcecom", async (req, res) => {
+  const { idTipoP } = req.query;
+  const idsTipoP = idTipoP
+    ? String(idTipoP)
+        .split(",")
+        .map((n) => parseInt(n.trim(), 10))
+        .filter((n) => !Number.isNaN(n))
+    : [];
+
+  const cacheKey = `lugarcecom_${idsTipoP.join(",") || "all"}`;
+
+  try {
+    const data = await obtenerConCache(cacheKey, async () => {
+      const queries = [
+        db.query("SELECT id AS value, nombre AS label FROM cat_modalidad ORDER BY nombre"),
+        db.query(`
+          SELECT u.id_usuario AS value, 
+            CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS label 
+          FROM usuarios_sistema u 
+          INNER JOIN persona p ON u.id_usuario = p.id_persona
+          WHERE p.estado_laboral = 'ACTIVO'
+          ORDER BY p.apellido_paterno, p.nombres
+        `),
+        db.query("SELECT id_origen AS value, descripcion AS label FROM origen ORDER BY descripcion"),
+        db.query(
+          'SELECT id_camara AS value, CONCAT(codigo_camara, " - ", nombre_camara) AS label FROM camara WHERE estado = 1 ORDER BY codigo_camara ASC'
+        ),
+        idsTipoP.length > 0
+          ? db.query("SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje WHERE id_tipop IN (?)", [
+              idsTipoP,
+            ])
+          : db.query("SELECT id_tipop AS value, nombre AS label FROM tipo_patrullaje ORDER BY nombre"),
+        db.query("SELECT id_modalidadp AS value, nombre AS label FROM modalidad_patrullaje ORDER BY nombre"),
+        db.query("SELECT id_tipo_via AS value, abreviatura AS label FROM tipo_via ORDER BY abreviatura ASC"),
+        db.query(`
+          SELECT 
+            id_persona AS value, 
+            CONCAT(apellido_paterno, ' ', apellido_materno, ', ', nombres) AS label,
+            documento_numero,
+            cargo_operativo,
+            foto_perfil
+          FROM personal_operativo 
+          WHERE estado = 1 
+          ORDER BY apellido_paterno ASC
+        `),
+        db.query(
+          `SELECT l.id_lugar AS value, l.nombre_lugar AS label 
+           FROM lugar l
+           WHERE l.id_lugar IN (?) OR l.id_lugar BETWEEN 2042 AND 2050
+           ORDER BY l.nombre_lugar ASC`,
+          [[2121]]
+        ),
+      ];
+
+      const results = await Promise.all(queries);
+      return {
+        modalidades: results[0][0],
+        usuarios: results[1][0],
+        origenes: results[2][0],
+        camaras: results[3][0],
+        tipos_patrullaje: results[4][0],
+        modalidades_patrullaje: results[5][0],
+        tipos_via: results[6][0],
+        personal_operativo: results[7][0],
+        lugares: results[8][0],
+      };
+    });
+
+    res.json(data);
+  } catch (error) {
+    console.error("Error al cargar lugarcecom:", error);
+    res.status(500).json({ error: "Error interno al cargar catálogos" });
+  }
+});
+
+
+
+
 // En tu servidor (archivo de rutas)
 app.get("/catalogos/lugares", async (req, res) => {
-  // Si envías ?tipo=2, tipoLugar valdrá '2'
   const { tipo } = req.query;
+  if (!tipo) {
+    return res.status(400).json({ error: "Falta el parámetro tipo" });
+  }
+
   try {
-    const [rows] = await db.query(
-      "SELECT id_lugar AS value, nombre_lugar AS label FROM lugar WHERE id_tipo_lugar = ?",
-      [tipo], // Aquí se inyecta el valor de forma segura
-    );
+    const rows = await obtenerConCache(`cat_lugares_${tipo}`, async () => {
+      const [r] = await db.query(
+        "SELECT id_lugar AS value, nombre_lugar AS label FROM lugar WHERE id_tipo_lugar = ? ORDER BY nombre_lugar ASC",
+        [tipo]
+      );
+      return r;
+    });
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
+let ocurrenciasCacheVersion = 1;
 
 app.get("/catalogos/modalidad", async (req, res) => {
-  const { tipo } = req.query; // Si ya no lo usas, puedes omitirlo o dejarlo por si lo necesitas luego
   try {
-    const [rows] = await db.query(
-      "SELECT id AS value, nombre AS label FROM cat_modalidad",
-    );
+    const rows = await obtenerConCache("cat_modalidades_simple", async () => {
+      const [r] = await db.query(
+        "SELECT id AS value, nombre AS label FROM cat_modalidad ORDER BY nombre ASC"
+      );
+      return r;
+    });
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -7045,44 +6562,35 @@ app.get("/catalogos/modalidad", async (req, res) => {
 });
 
 app.get("/catalogos/camposipcop", async (req, res) => {
-  const { id } = req.query; // Si necesitas el ID para editar, puedes recibirlo por query o params
+  const { id } = req.query;
   try {
-    // 1. Ejecutas todas las consultas de tus 5 tablas en paralelo
-    const [medioRows] = await db.query(
-      "SELECT id_medio AS value, descripcion AS label FROM sipcop_medio",
-    );
-    const [lugarsRows] = await db.query(
-      "SELECT id_lugarsip AS value, descripcion AS label FROM sipcop_lugar",
-    );
-    const [consecuenciaRows] = await db.query(
-      "SELECT id_consecuencia AS value, descripcion AS label FROM sipcop_consecuencia",
-    );
-    const [resultadoRows] = await db.query(
-      "SELECT id_resultado AS value, descripcion AS label FROM sipcop_resultado",
-    );
-    const [relacionRows] = await db.query(
-      "SELECT id_relacion_v AS value, descripcion AS label FROM sipcop_relacion_v",
-    );
+    const catalogos = await obtenerConCache("cat_campos_sipcop", async () => {
+      const [
+        [medios],
+        [lugares],
+        [consecuencias],
+        [resultados],
+        [relaciones],
+      ] = await Promise.all([
+        db.query("SELECT id_medio AS value, descripcion AS label FROM sipcop_medio"),
+        db.query("SELECT id_lugarsip AS value, descripcion AS label FROM sipcop_lugar"),
+        db.query("SELECT id_consecuencia AS value, descripcion AS label FROM sipcop_consecuencia"),
+        db.query("SELECT id_resultado AS value, descripcion AS label FROM sipcop_resultado"),
+        db.query("SELECT id_relacion_v AS value, descripcion AS label FROM sipcop_relacion_v"),
+      ]);
+      return { medios, lugares, consecuencias, resultados, relaciones };
+    });
 
-    // 2. Si estás editando y pasas un ID, también puedes buscar el registro actual aquí mismo:
-    let registroActual = {};
+    let registro = {};
     if (id) {
       const [ocurrenciaRows] = await db.query(
         "SELECT * FROM ocurrencia_registro WHERE id_ocurrencia = ?",
-        [id],
+        [id]
       );
-      registroActual = ocurrenciaRows[0] || {};
+      registro = ocurrenciaRows[0] || {};
     }
 
-    // 3. Devuelves todo en un solo objeto JSON ordenado
-    res.json({
-      medios: medioRows,
-      lugares: lugarsRows,
-      consecuencias: consecuenciaRows,
-      resultados: resultadoRows,
-      relaciones: relacionRows,
-      registro: registroActual, // Los valores actuales para cuando edites
-    });
+    res.json({ ...catalogos, registro });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -7423,6 +6931,7 @@ app.get("/ocurrencias/exportar-excel-total", async (req, res) => {
 
         WHERE o.fecha_reporte BETWEEN ? AND ?
         ORDER BY o.fecha_reporte DESC
+        LIMIT 10000
     `;
 
     const [rows] = await connection.query(sql, [fecha_inicio, fecha_fin]);
@@ -7462,45 +6971,38 @@ const safeJSONParse = (jsonString, fallback = []) => {
 
 
 app.get("/ocurrencias/listar/tablasipcop-rango", async (req, res) => {
-  let connection;
   try {
-    connection = await db.getConnection();
-
-    // 1. Paginación
-    const page = Math.max(1, parseInt(req.query.page || req.query.pagina) || 1);
-    const limit = Math.min(
-      Math.max(1, parseInt(req.query.limit || req.query.limite) || 50),
-      50
-    );
+    const page = Math.max(1, parseInt(req.query.page || req.query.pagina, 10) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit || req.query.limite, 10) || 50), 50);
     const offset = (page - 1) * limit;
 
-    // 2. Parámetros de rango (Soporta camelCase del frontend y snake_case)
-    const fecha_inicio = req.query.fechaInicio || req.query.fecha_inicio;
-    const fecha_fin = req.query.fechaFin || req.query.fecha_fin;
+    const fecha_inicio = req.query.fechaInicio || req.query.fecha_inicio || "";
+    const fecha_fin = req.query.fechaFin || req.query.fecha_fin || "";
 
-    let whereClause = "";
-    const paramsWhere = [];
+    const cacheKey = `rango_v${ocurrenciasCacheVersion}_${fecha_inicio || "12h"}_${fecha_fin || "12h"}_p${page}_l${limit}`;
 
-    if (fecha_inicio && fecha_fin) {
-      whereClause = `WHERE o.fecha_reporte BETWEEN ? AND ?`;
-      paramsWhere.push(fecha_inicio, fecha_fin);
-    } else {
-      whereConditions.push(`o.fecha_reporte >= DATE_SUB(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00'), INTERVAL 12 HOUR)`);
-   
-    }
+    const respuesta = await obtenerConCache(
+      cacheKey,
+      async () => {
+        let whereClause = "";
+        const paramsWhere = [];
 
-    // 3. Conteo total exacto de ocurrencias
-    const countSql = `
-      SELECT COUNT(o.id_ocurrencia) AS total 
-      FROM ocurrencia_registro o
-      ${whereClause}
-    `;
-    const [countRows] = await connection.query(countSql, paramsWhere);
-    const totalRegistros = countRows[0]?.total || 0;
+        if (fecha_inicio && fecha_fin) {
+          whereClause = "WHERE o.fecha_reporte BETWEEN ? AND ?";
+          paramsWhere.push(fecha_inicio, fecha_fin);
+        } else {
+          whereClause =
+            "WHERE o.fecha_reporte >= DATE_SUB(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00'), INTERVAL 12 HOUR)";
+        }
 
-    // 4. Consulta principal optimizada (Sin JOINs multiplicativos)
-    const sql = `
-        SELECT 
+        const countSql = `
+          SELECT COUNT(o.id_ocurrencia) AS total 
+          FROM ocurrencia_registro o
+          ${whereClause}
+        `;
+
+        const sql = `
+          SELECT 
             o.id_ocurrencia,
             DATE_FORMAT(o.fecha_reporte, '%Y-%m-%d %H:%i:%s') AS fecha_reporte,
             DATE_FORMAT(o.fecha_evento, '%Y-%m-%d') AS fecha_evento,
@@ -7515,12 +7017,9 @@ app.get("/ocurrencias/listar/tablasipcop-rango", async (req, res) => {
             o.estado,
             o.patrimonio_real,
             o.arresto_ciudadano,
-            
-            -- Datos de Persona y Usuario
+            o.id_lugar,
             CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS persona_nombre_completo,
             p.documento_numero AS persona_dni,
-            
-            -- Datos de Llamada, Origen, Modalidad y Ubicación
             dlo.numero_telefono,
             dlo.nombre_informante,
             m.nombre AS modalidad_nombre,
@@ -7528,101 +7027,95 @@ app.get("/ocurrencias/listar/tablasipcop-rango", async (req, res) => {
             tp.nombre AS tipo_patrullaje_nombre,
             l.nombre_lugar,
             v.nombre_via AS via_nombre,
-
-          (SELECT COALESCE(
+            (SELECT COALESCE(
                 JSON_ARRAYAGG(
-                    IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
-                       CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
-                       spf.placa)
+                  IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
+                     CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
+                     spf.placa)
                 ),
                 JSON_ARRAY()
-             )
+              )
              FROM ocurrencia_vehiculo_detalle ovd
              LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
              LEFT JOIN tipo_vehiculo tvh ON ovd.id_tipo_vehiculo = tvh.id_tipo_vehiculo
              WHERE ovd.id_ocurrencia = o.id_ocurrencia
             ) AS vehiculos_json,
-
-            -- Subconsulta JSON: Cámaras
-            (SELECT COALESCE(
-                JSON_ARRAYAGG(camar.nombre_camara),
-                JSON_ARRAY()
-             ) 
+            (SELECT COALESCE(JSON_ARRAYAGG(camar.nombre_camara), JSON_ARRAY()) 
              FROM detalle_camara_ocurrencia dcam 
              INNER JOIN camara camar ON dcam.id_camara = camar.id_camara 
              WHERE dcam.id_ocurrencia = o.id_ocurrencia
             ) AS camaras_json,
-            
-            -- Subconsulta JSON: Fotos
-            (SELECT COALESCE(
-                JSON_ARRAYAGG(f.url_imagen),
-                JSON_ARRAY()
-             ) 
+            (SELECT COALESCE(JSON_ARRAYAGG(f.url_imagen), JSON_ARRAY()) 
              FROM foto_ocurrencia_registro f 
              WHERE f.id_ocurrencia = o.id_ocurrencia AND f.url_imagen IS NOT NULL
             ) AS fotos_json
+          FROM ocurrencia_registro o
+          LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
+          LEFT JOIN persona p ON us.id_persona = p.id_persona
+          LEFT JOIN lugar l ON o.id_lugar = l.id_lugar
+          LEFT JOIN via v ON l.id_via = v.id_via
+          LEFT JOIN origen ori ON o.id_origen = ori.id_origen 
+          LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+          LEFT JOIN tipo_patrullaje tp ON o.id_tipop = tp.id_tipop
+          LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
+          ${whereClause}
+          ORDER BY o.fecha_reporte DESC 
+          LIMIT ? OFFSET ?
+        `;
 
-        FROM ocurrencia_registro o
-        LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
-        LEFT JOIN persona p ON us.id_persona = p.id_persona
-        LEFT JOIN lugar l ON o.id_lugar = l.id_lugar
-        LEFT JOIN via v ON l.id_via = v.id_via
-        LEFT JOIN origen ori ON o.id_origen = ori.id_origen 
-        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-        LEFT JOIN tipo_patrullaje tp ON o.id_tipop = tp.id_tipop
-        LEFT JOIN detalle_llamada_ocurrencia dlo ON o.id_ocurrencia = dlo.id_ocurrencia
+        const [[countRows], [rows]] = await Promise.all([
+          db.query(countSql, paramsWhere),
+          db.query(sql, [...paramsWhere, limit, offset]),
+        ]);
 
-        ${whereClause}
+        const totalRegistros = countRows[0]?.total || 0;
 
-        ORDER BY o.fecha_reporte DESC 
-        LIMIT ? OFFSET ?
-    `;
+        const parseArr = (val) => {
+          if (!val) return [];
+          if (Array.isArray(val)) return val;
+          try {
+            const p = JSON.parse(val);
+            return Array.isArray(p) ? p : [];
+          } catch {
+            return [];
+          }
+        };
 
-    const queryParams = [...paramsWhere, limit, offset];
-    const [rows] = await connection.query(sql, queryParams);
+        const datosMapeados = rows.map((item) => {
+          const listaFotos = parseArr(item.fotos_json).filter((f) => f && f !== "null");
+          const listaCamaras = parseArr(item.camaras_json);
+          const listaVehiculos = parseArr(item.vehiculos_json);
 
-    // 5. Mapeo seguro de arrays JSON
-    const datosMapeados = rows.map((item) => {
-      let listaFotos = [];
-      let listaCamaras = [];
-      let listaVehiculos = [];
+          return {
+            ...item,
+            fecha_evento: item.fecha_evento || "S/F",
+            fecha_reporte: item.fecha_reporte || "S/F",
+            placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin unidad",
+            vehiculos: listaVehiculos,
+            camaras: listaCamaras,
+            total_fotos: listaFotos.length,
+            tiene_fotos: listaFotos.length > 0,
+            foto_principal: listaFotos[0] || null,
+            fotos: listaFotos,
+            lista_fotos: listaFotos,
+          };
+        });
 
-      try { listaFotos = item.fotos_json ? JSON.parse(item.fotos_json) : []; } catch (e) {}
-      try { listaCamaras = item.camaras_json ? JSON.parse(item.camaras_json) : []; } catch (e) {}
-      try { listaVehiculos = item.vehiculos_json ? JSON.parse(item.vehiculos_json) : []; } catch (e) {}
+        return {
+          success: true,
+          total: totalRegistros,
+          paginaActual: page,
+          registrosPorPagina: limit,
+          data: datosMapeados,
+        };
+      },
+      20 * 1000
+    );
 
-      return {
-        ...item,
-        fecha_evento: item.fecha_evento || "S/F",
-        fecha_reporte: item.fecha_reporte || "S/F",
-        
-        // Mantenemos retrocompatibilidad con campos de UI
-        placa_con_tipo: listaVehiculos.length > 0 ? listaVehiculos.join(", ") : "Sin unidad",
-        vehiculos: listaVehiculos,
-        camaras: listaCamaras,
-        
-        // Fotos
-        total_fotos: listaFotos.length,
-        tiene_fotos: listaFotos.length > 0,
-        foto_principal: listaFotos[0] || null,
-        fotos: listaFotos,
-        lista_fotos: listaFotos
-      };
-    });
-
-    res.json({
-      success: true,
-      total: totalRegistros,
-      paginaActual: page,
-      registrosPorPagina: limit,
-      data: datosMapeados,
-    });
-
+    res.json(respuesta);
   } catch (error) {
     console.error("ERROR EN /ocurrencias/listar/tablasipcop-rango:", error);
     res.status(500).json({ success: false, total: 0, data: [] });
-  } finally {
-    if (connection) connection.release();
   }
 });
 
@@ -8539,198 +8032,187 @@ app.get("/ocurrencias/listar/exportarformato", async (req, res) => {
 
 
 app.get("/ocurrencias/listar/tablasipcop-avanzado", async (req, res) => {
-  let connection;
   try {
-    connection = await db.getConnection();
-
-    const page = Math.max(1, parseInt(req.query.page || req.query.pagina) || 1);
-    const limit = Math.min(Math.max(1, parseInt(req.query.limit || req.query.limite) || 25), 100);
+    const page = Math.max(1, parseInt(req.query.page || req.query.pagina, 10) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit || req.query.limite, 10) || 25), 100);
     const offset = (page - 1) * limit;
 
-    const idUsuario = req.query.id_usuario;
-    const fecRepInicio = req.query.fecha_reporte_inicio;
-    const fecRepFin = req.query.fecha_reporte_fin;
-    const fecEvtInicio = req.query.fecha_evento_inicio;
-    const fecEvtFin = req.query.fecha_evento_fin;
-    
-    // Limpieza de arrays de filtros
-    const modalidades = req.query.modalidades ? req.query.modalidades.split(",").map(m => m.trim()).filter(Boolean) : [];
-    const estados = req.query.estados ? req.query.estados.split(",").map(e => e.trim()).filter(Boolean) : [];
-    
-    const patrimonioReal = req.query.patrimonio;
-    const arrestoCiudadano = req.query.arresto;
-    const tipoDelito = req.query.delito; // "robo_hurto"
+    const idUsuario = req.query.id_usuario ? String(req.query.id_usuario).trim() : "";
+    const fecRepInicio = req.query.fecha_reporte_inicio ? String(req.query.fecha_reporte_inicio).trim() : "";
+    const fecRepFin = req.query.fecha_reporte_fin ? String(req.query.fecha_reporte_fin).trim() : "";
+    const fecEvtInicio = req.query.fecha_evento_inicio ? String(req.query.fecha_evento_inicio).trim() : "";
+    const fecEvtFin = req.query.fecha_evento_fin ? String(req.query.fecha_evento_fin).trim() : "";
 
-    let whereConditions = [];
-    let paramsWhere = [];
+    const modalidades = req.query.modalidades
+      ? String(req.query.modalidades).split(",").map((m) => m.trim()).filter(Boolean)
+      : [];
+    const estados = req.query.estados
+      ? String(req.query.estados).split(",").map((e) => e.trim()).filter(Boolean)
+      : [];
 
-    // =========================================================================
-    // 1. MANEJO DE FECHAS
-    // =========================================================================
+    const patrimonioReal = req.query.patrimonio ? String(req.query.patrimonio).trim() : "";
+    const arrestoCiudadano = req.query.arresto ? String(req.query.arresto).trim() : "";
+    const tipoDelito = req.query.delito ? String(req.query.delito).trim() : "";
+
     const tieneFiltroReporte = Boolean(fecRepInicio && fecRepFin);
     const tieneFiltroEvento = Boolean(fecEvtInicio && fecEvtFin);
+    const esConsultaPorDefecto =
+      !tieneFiltroReporte &&
+      !tieneFiltroEvento &&
+      !idUsuario &&
+      modalidades.length === 0 &&
+      estados.length === 0 &&
+      !patrimonioReal &&
+      !arrestoCiudadano &&
+      !tipoDelito;
 
-    if (tieneFiltroReporte) {
-      whereConditions.push(`(o.fecha_reporte >= ? AND o.fecha_reporte <= ?)`);
-      paramsWhere.push(`${fecRepInicio} 00:00:00`, `${fecRepFin} 23:59:59`);
-    }
+    const ejecutarConsulta = async () => {
+      const whereConditions = [];
+      const paramsWhere = [];
 
-    if (tieneFiltroEvento) {
-      whereConditions.push(`(o.fecha_evento BETWEEN ? AND ?)`);
-      paramsWhere.push(fecEvtInicio, fecEvtFin);
-    }
+      if (tieneFiltroReporte) {
+        whereConditions.push("(o.fecha_reporte >= ? AND o.fecha_reporte <= ?)");
+        paramsWhere.push(`${fecRepInicio} 00:00:00`, `${fecRepFin} 23:59:59`);
+      }
 
-    if (!tieneFiltroReporte && !tieneFiltroEvento) {
-      whereConditions.push(`(o.fecha_reporte >= DATE_SUB(NOW(), INTERVAL 12 HOUR))`);
-    }
+      if (tieneFiltroEvento) {
+        whereConditions.push("(o.fecha_evento BETWEEN ? AND ?)");
+        paramsWhere.push(fecEvtInicio, fecEvtFin);
+      }
 
-    // =========================================================================
-    // 2. OTROS FILTROS
-    // =========================================================================
-    if (idUsuario) {
-      whereConditions.push(`(o.id_usuario = ?)`);
-      paramsWhere.push(idUsuario);
-    }
+      if (!tieneFiltroReporte && !tieneFiltroEvento) {
+        // Hora exacta de Perú (evita el desfase de +5h de NOW() en Render UTC)
+        whereConditions.push(
+          "(o.fecha_reporte >= DATE_SUB(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '-05:00'), INTERVAL 12 HOUR))"
+        );
+      }
 
-    if (modalidades.length > 0) {
-      const placeholders = modalidades.map(() => "?").join(",");
-      whereConditions.push(`(m.nombre IN (${placeholders}))`);
-      paramsWhere.push(...modalidades);
-    }
+      if (idUsuario) {
+        whereConditions.push("(o.id_usuario = ?)");
+        paramsWhere.push(idUsuario);
+      }
 
-    if (estados.length > 0) {
-      const placeholders = estados.map(() => "?").join(",");
-      whereConditions.push(`(o.estado IN (${placeholders}))`);
-      paramsWhere.push(...estados);
-    }
+      if (modalidades.length > 0) {
+        const placeholders = modalidades.map(() => "?").join(",");
+        whereConditions.push(`(m.nombre IN (${placeholders}))`);
+        paramsWhere.push(...modalidades);
+      }
 
-    if (patrimonioReal && patrimonioReal !== "") {
-      whereConditions.push(`(o.patrimonio_real = ?)`);
-      paramsWhere.push(patrimonioReal);
-    }
+      if (estados.length > 0) {
+        const placeholders = estados.map(() => "?").join(",");
+        whereConditions.push(`(o.estado IN (${placeholders}))`);
+        paramsWhere.push(...estados);
+      }
 
-    if (arrestoCiudadano && arrestoCiudadano !== "") {
-      whereConditions.push(`(o.arresto_ciudadano = ?)`);
-      paramsWhere.push(arrestoCiudadano);
-    }
+      if (patrimonioReal) {
+        whereConditions.push("(o.patrimonio_real = ?)");
+        paramsWhere.push(patrimonioReal);
+      }
 
-    if (tipoDelito === "robo_hurto") {
-      whereConditions.push(`(LOWER(o.descripcion) LIKE '%robo%' OR LOWER(o.descripcion) LIKE '%hurto%')`);
-    }
+      if (arrestoCiudadano) {
+        whereConditions.push("(o.arresto_ciudadano = ?)");
+        paramsWhere.push(arrestoCiudadano);
+      }
 
-    const whereClause = "WHERE " + whereConditions.join(" AND ");
+      if (tipoDelito === "robo_hurto") {
+        whereConditions.push(
+          "(LOWER(o.descripcion) LIKE '%robo%' OR LOWER(o.descripcion) LIKE '%hurto%')"
+        );
+      }
 
-    // 1. Conteo total general
-    const countSql = `
-      SELECT COUNT(o.id_ocurrencia) AS total 
-      FROM ocurrencia_registro o
-      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-      ${whereClause}
-    `;
-    const [countRows] = await connection.query(countSql, paramsWhere);
-    const totalRegistros = countRows[0]?.total || 0;
+      const whereClause = "WHERE " + whereConditions.join(" AND ");
+      const joinModalidadSiNecesario =
+        modalidades.length > 0 ? "LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id" : "";
 
-    // 2. Conteo por estados
-    const countEstadosSql = `
-      SELECT COALESCE(o.estado, 'SIN ESTADO') AS estado, COUNT(o.id_ocurrencia) AS cantidad
-      FROM ocurrencia_registro o
-      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-      ${whereClause}
-      GROUP BY o.estado
-    `;
-    const [estadosRows] = await connection.query(countEstadosSql, paramsWhere);
-    
-    const conteosPorEstado = {};
-    estadosRows.forEach(row => {
-      conteosPorEstado[String(row.estado).toUpperCase()] = row.cantidad;
-    });
+      // Una sola consulta obtiene el conteo por estado y la suma total
+      const countEstadosSql = `
+        SELECT COALESCE(o.estado, 'SIN ESTADO') AS estado, COUNT(o.id_ocurrencia) AS cantidad
+        FROM ocurrencia_registro o
+        ${joinModalidadSiNecesario}
+        ${whereClause}
+        GROUP BY o.estado
+      `;
 
-    // 3. Consulta Principal Avanzada (Con todas las relaciones y subconsultas integradas)
-    const sql = `
+      const sql = `
         SELECT 
-            o.id_ocurrencia,
-            DATE_FORMAT(o.fecha_reporte, '%d/%m/%Y %H:%i:%s') AS fecha_reporte,
-            DATE_FORMAT(o.fecha_evento, '%d/%m/%Y') AS fecha_evento,
-            o.hora_alerta,
-            o.hora_llegada,
-            o.hora_repliegue,
-            o.distancia_metros,
-            o.referencia,
-            o.turno,
-            o.turnr,
-            o.turnrm,
-            o.estado,
-            o.patrimonio_real,
-            o.arresto_ciudadano,
-            o.codigo_seguimiento,
-            o.descripcion AS ocurrencia_descripcion,
-            o.estado_involucrados,
-            o.tipo_servicio_global,
-            CONCAT(o.latitud_gps, ' ', o.longitud_gps) AS coordenada,
-            o.unidad_encargada,
-            
-            CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS persona_nombre_completo,
-            p.documento_numero AS persona_dni,
-            
-            dlo.numero_telefono,
-            dlo.nombre_informante,
-            m.nombre AS modalidad_nombre,
-            m.codigo AS codmod,
-            cesp.nombre AS cat_especifica_nombre,
-            cgen.nombre AS cat_generica_nombre,
-            
-            ori.descripcion AS origen_descripcion,
-            tp.nombre AS tipo_patrullaje_nombre,
-            mp.nombre AS mod_patrullaje_nombre,
-            l.nombre_lugar,
-            v.nombre_via AS via_nombre,
-            c.numero_cuadra AS cuadra,
-            CONCAT(COALESCE(tv.abreviatura, ''), ' ', COALESCE(v.nombre_via, ''), ' CDRA. ', COALESCE(c.numero_cuadra, '')) AS label,
-            
-            SR.descripcion AS resultado_des,
-            SM.descripcion AS medio_des,
-            SL.descripcion AS lugar_des,
-            SC.descripcion AS consecuencia_des,
-
-            tvh.descripcion AS vehiculo_tipo,
-            spf.placa AS vehiculo_placa,
-            IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
-                CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
-                spf.placa
-            ) AS placa_con_tipo,
-            ovd.tipo_asignacion,
-
-            (SELECT CONCAT_WS(' ', pnp_sub.grado, pnp_sub.nombres, pnp_sub.apellidos)
-             FROM ocurrencia_vehiculo_detalle ovd_sub
-             INNER JOIN cat_pnp pnp_sub ON ovd_sub.id_pnp = pnp_sub.id_pnp
-             WHERE ovd_sub.id_ocurrencia = o.id_ocurrencia AND ovd_sub.id_pnp IS NOT NULL
-             LIMIT 1
-            ) AS pnp_nombre_completo,
-
-            (SELECT COALESCE(JSON_ARRAYAGG(f.url_imagen), JSON_ARRAY()) 
-             FROM foto_ocurrencia_registro f 
-             WHERE f.id_ocurrencia = o.id_ocurrencia AND f.url_imagen IS NOT NULL
-            ) AS fotos_json,
-
-            (SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
-                'id_detalle_victima', dv_sub.id_detalle_victima,
-                'nombre_victima', dv_sub.nombre_victima,
-                'edad', dv_sub.edad,
-                'placa_victima', dv_sub.placa_victima,
-                'id_relacion_v', dv_sub.id_relacion_v
-            )), '[]') AS CHAR)
-             FROM detalle_victimas_ocurrencia dv_sub WHERE dv_sub.id_ocurrencia = o.id_ocurrencia
-            ) AS victimas_json,
-
-            (SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
-                'id_detalle_agresor', da_sub.id_detalle_agresor,
-                'nombre_agresor', da_sub.nombre_agresor,
-                'edad', da_sub.edad,
-                'placa_agresor', da_sub.placa_agresor
-            )), '[]') AS CHAR)
-             FROM detalle_agresores_ocurrencia da_sub WHERE da_sub.id_ocurrencia = o.id_ocurrencia
-            ) AS agresores_json
-
+          o.id_ocurrencia,
+          DATE_FORMAT(o.fecha_reporte, '%d/%m/%Y %H:%i:%s') AS fecha_reporte,
+          DATE_FORMAT(o.fecha_evento, '%d/%m/%Y') AS fecha_evento,
+          o.hora_alerta,
+          o.hora_llegada,
+          o.hora_repliegue,
+          o.distancia_metros,
+          o.referencia,
+          o.turno,
+          o.turnr,
+          o.turnrm,
+          o.estado,
+          o.patrimonio_real,
+          o.arresto_ciudadano,
+          o.codigo_seguimiento,
+          o.descripcion AS ocurrencia_descripcion,
+          o.estado_involucrados,
+          o.tipo_servicio_global,
+          CONCAT(o.latitud_gps, ' ', o.longitud_gps) AS coordenada,
+          o.unidad_encargada,
+          o.id_modalidad,
+          o.id_resultado_real,
+          o.id_medio_real,
+          o.id_lugar_real,
+          o.id_consecuencia_real,
+          CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) AS persona_nombre_completo,
+          p.documento_numero AS persona_dni,
+          dlo.numero_telefono,
+          dlo.nombre_informante,
+          m.nombre AS modalidad_nombre,
+          m.codigo AS codmod,
+          cesp.nombre AS cat_especifica_nombre,
+          cgen.nombre AS cat_generica_nombre,
+          ori.descripcion AS origen_descripcion,
+          tp.nombre AS tipo_patrullaje_nombre,
+          mp.nombre AS mod_patrullaje_nombre,
+          l.nombre_lugar,
+          v.nombre_via AS via_nombre,
+          c.numero_cuadra AS cuadra,
+          CONCAT(COALESCE(tv.abreviatura, ''), ' ', COALESCE(v.nombre_via, ''), ' CDRA. ', COALESCE(c.numero_cuadra, '')) AS label,
+          SR.descripcion AS resultado_des,
+          SM.descripcion AS medio_des,
+          SL.descripcion AS lugar_des,
+          SC.descripcion AS consecuencia_des,
+          tvh.descripcion AS vehiculo_tipo,
+          spf.placa AS vehiculo_placa,
+          IF(tvh.descripcion IS NOT NULL AND tvh.descripcion != '', 
+            CONCAT(spf.placa, ' (', tvh.descripcion, ')'), 
+            spf.placa
+          ) AS placa_con_tipo,
+          ovd.tipo_asignacion,
+          (SELECT CONCAT_WS(' ', pnp_sub.grado, pnp_sub.nombres, pnp_sub.apellidos)
+           FROM ocurrencia_vehiculo_detalle ovd_sub
+           INNER JOIN cat_pnp pnp_sub ON ovd_sub.id_pnp = pnp_sub.id_pnp
+           WHERE ovd_sub.id_ocurrencia = o.id_ocurrencia AND ovd_sub.id_pnp IS NOT NULL
+           LIMIT 1
+          ) AS pnp_nombre_completo,
+          (SELECT COALESCE(JSON_ARRAYAGG(f.url_imagen), JSON_ARRAY()) 
+           FROM foto_ocurrencia_registro f 
+           WHERE f.id_ocurrencia = o.id_ocurrencia AND f.url_imagen IS NOT NULL
+          ) AS fotos_json,
+          (SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+              'id_detalle_victima', dv_sub.id_detalle_victima,
+              'nombre_victima', dv_sub.nombre_victima,
+              'edad', dv_sub.edad,
+              'placa_victima', dv_sub.placa_victima,
+              'id_relacion_v', dv_sub.id_relacion_v
+          )), '[]') AS CHAR)
+           FROM detalle_victimas_ocurrencia dv_sub WHERE dv_sub.id_ocurrencia = o.id_ocurrencia
+          ) AS victimas_json,
+          (SELECT CAST(COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+              'id_detalle_agresor', da_sub.id_detalle_agresor,
+              'nombre_agresor', da_sub.nombre_agresor,
+              'edad', da_sub.edad,
+              'placa_agresor', da_sub.placa_agresor
+          )), '[]') AS CHAR)
+           FROM detalle_agresores_ocurrencia da_sub WHERE da_sub.id_ocurrencia = o.id_ocurrencia
+          ) AS agresores_json
         FROM ocurrencia_registro o
         LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
         LEFT JOIN persona p ON us.id_persona = p.id_persona
@@ -8755,56 +8237,83 @@ app.get("/ocurrencias/listar/tablasipcop-avanzado", async (req, res) => {
         ${whereClause}
         ORDER BY o.fecha_reporte DESC 
         LIMIT ? OFFSET ?
-    `;
+      `;
 
-    const queryParams = [...paramsWhere, limit, offset];
-    const [rows] = await connection.query(sql, queryParams);
+      const [[estadosRows], [rows]] = await Promise.all([
+        db.query(countEstadosSql, paramsWhere),
+        db.query(sql, [...paramsWhere, limit, offset]),
+      ]);
 
-    const datosMapeados = rows.map((item) => {
-      let fotos = [];
-      let victimas = [];
-      let agresores = [];
-      try { fotos = JSON.parse(item.fotos_json || "[]"); } catch(e){}
-      try { victimas = JSON.parse(item.victimas_json || "[]"); } catch(e){}
-      try { agresores = JSON.parse(item.agresores_json || "[]"); } catch(e){}
+      const conteosPorEstado = {};
+      let totalRegistros = 0;
+      for (const row of estadosRows) {
+        const key = String(row.estado).toUpperCase();
+        conteosPorEstado[key] = row.cantidad;
+        totalRegistros += Number(row.cantidad) || 0;
+      }
 
-      const primeraVictima = victimas.length > 0 ? victimas[0] : {};
-      const primerAgresor = agresores.length > 0 ? agresores[0] : {};
+      const datosMapeados = rows.map((item) => {
+        let fotos = [];
+        let victimas = [];
+        let agresores = [];
+        try {
+          fotos = typeof item.fotos_json === "string" ? JSON.parse(item.fotos_json || "[]") : (item.fotos_json || []);
+        } catch (e) {}
+        try {
+          victimas = typeof item.victimas_json === "string" ? JSON.parse(item.victimas_json || "[]") : (item.victimas_json || []);
+        } catch (e) {}
+        try {
+          agresores = typeof item.agresores_json === "string" ? JSON.parse(item.agresores_json || "[]") : (item.agresores_json || []);
+        } catch (e) {}
+
+        const primeraVictima = victimas.length > 0 ? victimas[0] : {};
+        const primerAgresor = agresores.length > 0 ? agresores[0] : {};
+
+        return {
+          ...item,
+          fotos,
+          victimas,
+          agresores,
+          nombre_victima: primeraVictima.nombre_victima || "",
+          edad_victima: primeraVictima.edad || "",
+          relacion_victima: primeraVictima.id_relacion_v || null,
+          nombre_agresor: primerAgresor.nombre_agresor || "",
+          edad_agresor: primerAgresor.edad || "",
+          placa_agresor: primerAgresor.placa_agresor || "",
+          pnp_completo: item.pnp_nombre_completo || "No asignado",
+          tiene_fotos: fotos.length > 0,
+        };
+      });
 
       return {
-        ...item,
-        fotos,
-        victimas,
-        agresores,
-        nombre_victima: primeraVictima.nombre_victima || "",
-        edad_victima: primeraVictima.edad || "",
-        relacion_victima: primeraVictima.id_relacion_v || null,
-        nombre_agresor: primerAgresor.nombre_agresor || "",
-        edad_agresor: primerAgresor.edad || "",
-        placa_agresor: primerAgresor.placa_agresor || "",
-        pnp_completo: item.pnp_nombre_completo || "No asignado",
-        tiene_fotos: fotos.length > 0,
+        success: true,
+        total: totalRegistros,
+        conteosPorEstado,
+        es12Horas: !(tieneFiltroReporte || tieneFiltroEvento),
+        paginaActual: page,
+        registrosPorPagina: limit,
+        data: datosMapeados,
       };
-    });
+    };
 
-    const esRangoFechasPersonalizado = tieneFiltroReporte || tieneFiltroEvento;
+    // Caché de 20s en la vista por defecto (absorbe picos de 500 usuarios sin saturar MySQL)
+    if (esConsultaPorDefecto) {
+      const cacheKey = `tablasipcop_12h_v${ocurrenciasCacheVersion}_p${page}_l${limit}`;
+      const respuesta = await obtenerConCache(cacheKey, ejecutarConsulta, 20 * 1000);
+      return res.json(respuesta);
+    }
 
-    res.json({
-      success: true,
-      total: totalRegistros,
-      conteosPorEstado: conteosPorEstado,
-      es12Horas: !esRangoFechasPersonalizado,
-      paginaActual: page,
-      registrosPorPagina: limit,
-      data: datosMapeados,
-    });
-
+    const respuesta = await ejecutarConsulta();
+    return res.json(respuesta);
   } catch (error) {
     console.error("ERROR EN LISTAR AVANZADO:", error);
-    res.status(500).json({ success: false, total: 0, data: [] });
-  } finally {
-    if (connection) connection.release();
+    return res.status(500).json({ success: false, total: 0, data: [] });
+  
   }
+
+
+
+
 });
 // Endpoint Integrado: Apertura de Turno con Odómetro y Checklist Obligatorio
 app.post("/api/vehiculo/iniciar-servicio-checklist", async (req, res) => {
@@ -9315,35 +8824,26 @@ app.get("/catalogos/checklist-itemsfiltro", async (req, res) => {
 });
 app.get("/catalogos/checklist-itemsfiltro1", async (req, res) => {
   const { id_tipo_vehiculo } = req.query;
-
   if (!id_tipo_vehiculo) {
-    return res
-      .status(400)
-      .json({ error: "Falta el parámetro id_tipo_vehiculo" });
+    return res.status(400).json({ error: "Falta el parámetro id_tipo_vehiculo" });
   }
 
-  let connection;
   try {
-    connection = await db.getConnection();
-    const sql = `
-           SELECT 
-        cc.id_categoria, 
-        cc.nombre_categoria, 
-        c.id_item, 
-        c.componente AS nombre_item 
-    FROM checklist_items AS c 
-    INNER JOIN checklist_categorias AS cc ON cc.id_categoria = c.id_categoria 
-    WHERE c.estado_activo = 1  AND id_tipo_vehiculo = ?
-    ORDER BY cc.nombre_categoria, c.componente
-        `;
-
-    const [rows] = await connection.query(sql, [id_tipo_vehiculo]);
+    const rows = await obtenerConCache(`cat_checklist_f1_${id_tipo_vehiculo}`, async () => {
+      const [r] = await db.query(
+        `SELECT cc.id_categoria, cc.nombre_categoria, c.id_item, c.componente AS nombre_item 
+         FROM checklist_items AS c 
+         INNER JOIN checklist_categorias AS cc ON cc.id_categoria = c.id_categoria 
+         WHERE c.estado_activo = 1 AND id_tipo_vehiculo = ?
+         ORDER BY cc.nombre_categoria, c.componente`,
+        [id_tipo_vehiculo]
+      );
+      return r;
+    });
     res.json(rows);
   } catch (error) {
     console.error("Error en checklist:", error);
     res.status(500).json([]);
-  } finally {
-    if (connection) connection.release();
   }
 });
 app.post("/api/vehiculo/iniciar-servicio-checkcompleto", async (req, res) => {
@@ -10541,274 +10041,438 @@ function calcularFechaOperativa(fechaEventoStr, horaStr, tipoAccion, idTipoVehic
 // ==========================================
 app.post("/api/vehiculo/iniciar-servicio", async (req, res) => {
   let connection;
-
   try {
-    console.log("📩 PETICIÓN RECIBIDA (Inicio de Servicio):", req.body);
-
     const {
       id_usuario, id_lugar, id_modalidad, id_origen, id_camara, id_radio, id_zona,
       id_tipop, id_modalidadp, descripcion, hora_alerta, hora_llegada, hora_repliegue,
       latitud_gps, longitud_gps, nombre_punto_gps, referencia, unidad_encargada,
       fecha_evento, grupo, turno, estadoOcurrencia, fotos, vehiculos_detalle,
-      id_personal_ids, detalle_llamada, agresores_detalle, victimas_detalle
-    } = req.body;
+      id_personal_ids, detalle_llamada, agresores_detalle, victimas_detalle,
+      sector_asignado, // <--- 1. Recibimos el sector asignado del body
+    } = req.body || {};
+
+    if (!id_usuario || !id_lugar || !id_modalidad || !fecha_evento) {
+      return res.status(400).json({ success: false, error: "Faltan campos obligatorios." });
+    }
 
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-    // Obtener la hora exacta de Perú (America/Lima)
-    const fechaActual = new Date();
-    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
-    const fechaPeruObj = new Date(formatoPeru);
-    const fechaReportePeru = `${fechaPeruObj.getFullYear()}-${String(fechaPeruObj.getMonth() + 1).padStart(2, "0")}-${String(fechaPeruObj.getDate()).padStart(2, "0")} ${String(fechaPeruObj.getHours()).padStart(2, "0")}:${String(fechaPeruObj.getMinutes()).padStart(2, "0")}:${String(fechaPeruObj.getSeconds()).padStart(2, "0")}`;
+    const { fechaHora: fechaReportePeru } = obtenerFechaHoraPeru();
+    
+    const idRadioFinal =
+      id_radio ||
+      (Array.isArray(vehiculos_detalle)
+        ? vehiculos_detalle.find((v) => v?.id_radio)?.id_radio
+        : null) ||
+      null;
 
+    const idZonaFinal =
+      id_zona ||
+      (Array.isArray(vehiculos_detalle)
+        ? vehiculos_detalle.find((v) => v?.id_zona)?.id_zona
+        : null) ||
+      null;
+
+    // Validamos que el sector esté entre los valores permitidos, si no, se va como NULL
+    const sectoresPermitidos = ["1", "2", "3", "RF"];
+    const sectorFinal = sectoresPermitidos.includes(String(sector_asignado)) 
+      ? String(sector_asignado) 
+      : null;
+
+    // 2. Agregamos sector_asignado a la consulta SQL de ocurrencia_registro
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-        descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-        id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
-        id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
-        nombre_punto_gps, referencia, unidad_encargada, 
-        fecha_reporte, fecha_evento, estado, grupo, turno
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      descripcion, hora_alerta, hora_llegada, hora_repliegue, 
+      id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
+      id_tipop, id_modalidadp, latitud_gps, longitud_gps, 
+      nombre_punto_gps, referencia, unidad_encargada, 
+      fecha_reporte, fecha_evento, estado, grupo, turno, id_radio, id_zona, sector_asignado
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion, hora_alerta || null, hora_llegada || null, hora_repliegue || null,
-      id_lugar, id_usuario, id_modalidad, id_modalidad, id_origen,
-      id_tipop || null, id_modalidadp || null, latitud_gps || 0, longitud_gps || 0,
-      nombre_punto_gps || "", referencia || "", unidad_encargada || "SERENAZGO", fechaReportePeru,
-      fecha_evento, estadoOcurrencia, grupo, turno || null,
+      descripcion || "Inicio de Servicio",
+      hora_alerta || null,
+      hora_llegada || null,
+      hora_repliegue || null,
+      Number(id_lugar),
+      Number(id_usuario),
+      Number(id_modalidad),
+      Number(id_modalidad),
+      id_origen ? Number(id_origen) : 1,
+      id_tipop || null,
+      id_modalidadp || null,
+      latitud_gps || 0,
+      longitud_gps || 0,
+      nombre_punto_gps || "",
+      referencia || "",
+      unidad_encargada || "SERENAZGO",
+      fechaReportePeru,
+      fecha_evento,
+      estadoOcurrencia || "PENDIENTE",
+      grupo || null,
+      turno || null,
+      idRadioFinal ? Number(idRadioFinal) : null,
+      idZonaFinal ? Number(idZonaFinal) : null,
+      sectorFinal, // <--- 3. Pasamos el valor validado al array de parámetros
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
 
-    // Cámaras
     if (id_camara) {
-      let idsCam = Array.isArray(id_camara) ? id_camara : String(id_camara).split(",");
-      const idsCamLimpios = idsCam.map((id) => parseInt(id)).filter((id) => !isNaN(id));
+      const idsCam = Array.isArray(id_camara) ? id_camara : String(id_camara).split(",");
+      const idsCamLimpios = [...new Set(idsCam.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id)))];
       if (idsCamLimpios.length > 0) {
-        await connection.query("INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?", 
-          [idsCamLimpios.map(camId => [id_nueva_ocurrencia, camId])]
+        await connection.query(
+          "INSERT INTO detalle_camara_ocurrencia (id_ocurrencia, id_camara) VALUES ?",
+          [idsCamLimpios.map((camId) => [id_nueva_ocurrencia, camId])]
         );
       }
     }
 
-    // Personal de Apoyo
     if (id_personal_ids) {
-      let idsPers = Array.isArray(id_personal_ids) ? id_personal_ids : String(id_personal_ids).split(",");
-      const idsPersLimpios = idsPers.map((id) => parseInt(id)).filter((id) => !isNaN(id));
+      const idsPers = Array.isArray(id_personal_ids) ? id_personal_ids : String(id_personal_ids).split(",");
+      const idsPersLimpios = [...new Set(idsPers.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id)))];
       if (idsPersLimpios.length > 0) {
-        await connection.query("INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?", 
-          [idsPersLimpios.map(persId => [id_nueva_ocurrencia, persId])]
+        await connection.query(
+          "INSERT INTO personal_ocurrencia (id_ocurrencia, id_persona) VALUES ?",
+          [idsPersLimpios.map((persId) => [id_nueva_ocurrencia, persId])]
         );
       }
     }
 
-    // Vehículos y Checklist
-    if (vehiculos_detalle && Array.isArray(vehiculos_detalle) && vehiculos_detalle.length > 0) {
+    if (Array.isArray(vehiculos_detalle) && vehiculos_detalle.length > 0) {
       for (const v of vehiculos_detalle) {
         const id_unidad = v.id_unidad;
-        const odometro_inicial = v.odometro_inicial ? parseInt(v.odometro_inicial) : 0;
+        const odometro_inicial = v.odometro_inicial ? parseInt(v.odometro_inicial, 10) : 0;
         const id_tipo_vehiculo = v.id_tipo_vehiculo || 2;
 
-        const fechaOperativaAsignacion = calcularFechaOperativa(fecha_evento, hora_alerta || "00:00", "INICIO", id_tipo_vehiculo, turno);
+        const fechaOperativaAsignacion = calcularFechaOperativa(
+          fecha_evento,
+          hora_alerta || "00:00",
+          "INICIO",
+          id_tipo_vehiculo,
+          turno
+        );
 
-        // PREVENCIÓN: Si la unidad tiene un turno abierto previo olvidado, ciérralo preventivamente como SOLO INICIO
         const [vehiculoAbiertoPrevio] = await connection.query(
-          `SELECT id_detalle FROM ocurrencia_vehiculo_detalle WHERE id_unidad = ? AND odometro_final IS NULL LIMIT 1`,
+          `SELECT ini.id_detalle
+           FROM ocurrencia_vehiculo_detalle ini
+           WHERE ini.id_unidad = ?
+             AND ini.odometro_inicial IS NOT NULL
+             AND ini.odometro_final IS NULL
+             AND NOT EXISTS (
+               SELECT 1
+               FROM ocurrencia_vehiculo_detalle fin
+               WHERE fin.id_unidad = ini.id_unidad
+                 AND fin.odometro_final IS NOT NULL
+                 AND fin.odometro_inicial IS NULL
+                 AND (
+                   fin.fecha_asignacion > ini.fecha_asignacion
+                   OR (fin.fecha_asignacion = ini.fecha_asignacion AND fin.id_detalle > ini.id_detalle)
+                 )
+             )
+           ORDER BY ini.fecha_asignacion DESC, ini.id_detalle DESC
+           LIMIT 1`,
           [id_unidad]
         );
 
         if (vehiculoAbiertoPrevio.length > 0) {
-          console.warn(`⚠️ La unidad ${id_unidad} tenía un turno abierto huérfano. Cerrando preventivamente...`);
+          console.warn(`⚠️ Unidad ${id_unidad} con inicio huérfano (${vehiculoAbiertoPrevio[0].id_detalle}). Cerrando preventivamente.`);
           await connection.query(
-            `UPDATE ocurrencia_vehiculo_detalle SET odometro_final = odometro_inicial, estado_cierre = 'AUDITORIA_SOLO_INICIO' WHERE id_detalle = ?`,
+            `UPDATE ocurrencia_vehiculo_detalle
+             SET odometro_final = odometro_inicial, estado_cierre = 'AUDITORIA_SOLO_INICIO'
+             WHERE id_detalle = ?`,
             [vehiculoAbiertoPrevio[0].id_detalle]
           );
         }
 
         let turno_a_guardar = null;
-        let id_radio_final = null;
-        let id_zona_final = null;
-
         if (Number(id_modalidad) === 1) {
-          id_radio_final = v.id_radio || id_radio || null;
-          id_zona_final = v.id_zona || id_zona || null;
           turno_a_guardar = "ACTIVO";
         }
 
         const [resVehiculoDetalle] = await connection.query(
           `INSERT INTO ocurrencia_vehiculo_detalle 
-          (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp, odometro_inicial, fecha_asignacion, id_radio, id_zona) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id_ocurrencia, id_tipo_vehiculo, id_unidad, tipo_asignacion, id_pnp, odometro_inicial, fecha_asignacion) 
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [
-            id_nueva_ocurrencia, id_tipo_vehiculo, id_unidad, turno_a_guardar,
-            v.id_pnp || null, odometro_inicial, `${fechaOperativaAsignacion} ${hora_alerta || '00:00:00'}`,
-            id_radio_final, id_zona_final
+            id_nueva_ocurrencia,
+            id_tipo_vehiculo,
+            id_unidad,
+            turno_a_guardar,
+            v.id_pnp || null,
+            odometro_inicial,
+            `${fechaOperativaAsignacion} ${hora_alerta || "00:00:00"}`,
           ]
         );
 
         const id_detalle_insertado = resVehiculoDetalle.insertId;
 
-        // Checklist de defectos
         const itemsChecklist = v.checklist_items || v.checklist;
         if (Array.isArray(itemsChecklist) && itemsChecklist.length > 0) {
           const valuesChecklist = itemsChecklist
-            .filter((item) => !(item.esta_conforme === true || item.esta_conforme === 1 || item.esta_conforme === "1"))
+            .filter(
+              (item) =>
+                !(
+                  item.esta_conforme === true ||
+                  item.esta_conforme === 1 ||
+                  item.esta_conforme === "1"
+                )
+            )
             .map((item) => {
-              const idItem = parseInt(item.id_item || item.id);
-              return isNaN(idItem) ? null : [id_detalle_insertado, idItem, 0, item.observacion || ""];
+              const idItem = parseInt(item.id_item || item.id, 10);
+              return Number.isNaN(idItem)
+                ? null
+                : [id_detalle_insertado, idItem, 0, item.observacion || ""];
             })
             .filter((row) => row !== null);
 
           if (valuesChecklist.length > 0) {
-            await connection.query("INSERT INTO ocurrencia_vehiculo_checklist (id_detalle, id_item, esta_conforme, observacion) VALUES ?", [valuesChecklist]);
+            await connection.query(
+              "INSERT INTO ocurrencia_vehiculo_checklist (id_detalle, id_item, esta_conforme, observacion) VALUES ?",
+              [valuesChecklist]
+            );
           }
         }
       }
     }
 
-    // Llamadas, Agresores, Víctimas
     if (detalle_llamada && detalle_llamada.numero_telefono) {
       await connection.query(
         "INSERT INTO detalle_llamada_ocurrencia (id_ocurrencia, numero_telefono, nombre_informante) VALUES (?, ?, ?)",
-        [id_nueva_ocurrencia, detalle_llamada.numero_telefono, detalle_llamada.nombre_informante || "Anónimo"]
+        [
+          id_nueva_ocurrencia,
+          detalle_llamada.numero_telefono,
+          detalle_llamada.nombre_informante || "Anónimo",
+        ]
       );
     }
 
-    if (agresores_detalle && Array.isArray(agresores_detalle) && agresores_detalle.length > 0) {
-      const valuesAgresores = agresores_detalle.map((a) => [id_nueva_ocurrencia, a.nombre_agresor || "N.N.", a.id_tipo_vehiculo || null, a.placa_agresor || null]);
-      await connection.query("INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?", [valuesAgresores]);
+    if (Array.isArray(agresores_detalle) && agresores_detalle.length > 0) {
+      const valuesAgresores = agresores_detalle.map((a) => [
+        id_nueva_ocurrencia,
+        a.nombre_agresor || "N.N.",
+        a.id_tipo_vehiculo || null,
+        a.placa_agresor || null,
+      ]);
+      await connection.query(
+        "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, id_tipo_vehiculo, placa_agresor) VALUES ?",
+        [valuesAgresores]
+      );
     }
 
-    if (victimas_detalle && Array.isArray(victimas_detalle) && victimas_detalle.length > 0) {
-      const valuesVictimas = victimas_detalle.map((v) => [id_nueva_ocurrencia, v.nombre_victima || "N.N.", v.id_tipo_vehiculo || null, v.placa_victima || null, v.id_relacion_v || null]);
-      await connection.query("INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?", [valuesVictimas]);
+    if (Array.isArray(victimas_detalle) && victimas_detalle.length > 0) {
+      const valuesVictimas = victimas_detalle.map((v) => [
+        id_nueva_ocurrencia,
+        v.nombre_victima || "N.N.",
+        v.id_tipo_vehiculo || null,
+        v.placa_victima || null,
+        v.id_relacion_v || null,
+      ]);
+      await connection.query(
+        "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, id_tipo_vehiculo, placa_victima, id_relacion_v) VALUES ?",
+        [valuesVictimas]
+      );
     }
 
-    await connection.commit();
-    res.status(201).json({ success: true, message: "Inicio de servicio guardado correctamente.", id: id_nueva_ocurrencia });
+    const { fotosYaSubidas, fotosPendientesSubir } = clasificarFotosRegistro(id_nueva_ocurrencia, fotos);
+    if (fotosYaSubidas.length > 0) {
+      await connection.query(
+        "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES ?",
+        [fotosYaSubidas]
+      );
+    }
 
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(() => {});
+  await connection.commit();
+    ocurrenciasCacheVersion++;
+    res.status(201).json({
+      success: true,
+      message: "Inicio de servicio guardado correctamente.",
+      id: id_nueva_ocurrencia,
+    });
+
+    if (fotosPendientesSubir.length > 0) {
+      procesarYSubirFotosSegundoPlano(
+        id_nueva_ocurrencia,
+        fotosPendientesSubir,
+        db,
+        id_modalidad,
+        fecha_evento
+      ).catch((err) => {
+        console.error("🔴 Error en segundo plano de fotos (iniciar-servicio):", err.message);
+      });
     }
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rbErr) {
+        console.error("🔴 Error en rollback:", rbErr.message);
+      }
+    }
     console.error("🔴 ERROR EN INICIO:", error.message);
-    if (!res.headersSent) res.status(400).json({ success: false, error: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: "Error al iniciar servicio." });
+    }
   } finally {
     if (connection) connection.release();
   }
 });
 
 // ==========================================
-// ENDPOINT: FIN DE SERVICIO (LÓGICA EN NODE.JS - SIN TRIGGERS)
+// FIN DE SERVICIO VEHÍCULOS
 // ==========================================
 app.post("/api/vehiculo/finalizar-servicio", async (req, res) => {
   let connection;
-
   try {
-    console.log("🏁 PETICIÓN RECIBIDA (Fin de Servicio):", req.body);
-
     const {
       id_usuario, id_lugar, id_modalidad, id_origen, descripcion, hora_alerta,
       latitud_gps, longitud_gps, nombre_punto_gps, referencia, unidad_encargada,
-      fecha_evento, grupo, turno, estadoOcurrencia, fotos, vehiculos_detalle
-    } = req.body;
+      fecha_evento, grupo, turno, estadoOcurrencia, fotos, vehiculos_detalle,
+    } = req.body || {};
+
+    if (!id_usuario || !id_lugar || !id_modalidad || !fecha_evento) {
+      return res.status(400).json({ success: false, error: "Faltan campos obligatorios." });
+    }
 
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-    const fechaActual = new Date();
-    const formatoPeru = fechaActual.toLocaleString("en-US", { timeZone: "America/Lima", hour12: false });
-    const fechaPeruObj = new Date(formatoPeru);
-    const fechaReportePeru = `${fechaPeruObj.getFullYear()}-${String(fechaPeruObj.getMonth() + 1).padStart(2, "0")}-${String(fechaPeruObj.getDate()).padStart(2, "0")} ${String(fechaPeruObj.getHours()).padStart(2, "0")}:${String(fechaPeruObj.getMinutes()).padStart(2, "0")}:${String(fechaPeruObj.getSeconds()).padStart(2, "0")}`;
+    const { fechaHora: fechaReportePeru } = obtenerFechaHoraPeru();
 
-    // 1. Crear el registro principal de la ocurrencia de cierre
     const sqlOcurrencia = `INSERT INTO ocurrencia_registro (
-        descripcion, hora_alerta, hora_llegada, hora_repliegue, 
-        id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
-        latitud_gps, longitud_gps, nombre_punto_gps, referencia, unidad_encargada, 
-        fecha_reporte, fecha_evento, estado, grupo, turno
+      descripcion, hora_alerta, hora_llegada, hora_repliegue, 
+      id_lugar, id_usuario, id_modalidad, id_modalidad_inicial, id_origen,
+      latitud_gps, longitud_gps, nombre_punto_gps, referencia, unidad_encargada, 
+      fecha_reporte, fecha_evento, estado, grupo, turno
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     const [resOcurrencia] = await connection.query(sqlOcurrencia, [
-      descripcion || "Fin de Servicio", hora_alerta || null, hora_alerta || null, hora_alerta || null,
-      id_lugar, id_usuario, id_modalidad, id_modalidad, id_origen || 9,
-      latitud_gps || 0, longitud_gps || 0, nombre_punto_gps || "", referencia || "", 
-      unidad_encargada || "SERENAZGO", fechaReportePeru, fecha_evento, estadoOcurrencia, grupo, turno || null,
+      descripcion || "Fin de Servicio",
+      hora_alerta || null,
+      hora_alerta || null,
+      hora_alerta || null,
+      Number(id_lugar),
+      Number(id_usuario),
+      Number(id_modalidad),
+      Number(id_modalidad),
+      id_origen ? Number(id_origen) : 9,
+      latitud_gps || 0,
+      longitud_gps || 0,
+      nombre_punto_gps || "",
+      referencia || "",
+      unidad_encargada || "SERENAZGO",
+      fechaReportePeru,
+      fecha_evento,
+      estadoOcurrencia || "PENDIENTE",
+      grupo || null,
+      turno || null,
     ]);
 
     const id_nueva_ocurrencia = resOcurrencia.insertId;
 
-    // 2. Insertar el detalle de vehículos calculando todo directamente en Node.js
-    if (vehiculos_detalle && Array.isArray(vehiculos_detalle) && vehiculos_detalle.length > 0) {
+    if (Array.isArray(vehiculos_detalle) && vehiculos_detalle.length > 0) {
       for (const v of vehiculos_detalle) {
         const id_unidad = v.id_unidad;
-        const odometro_final_ingresado = v.odometro_inicial ? parseInt(v.odometro_inicial) : 0;
+        const odometro_final_ingresado = v.odometro_inicial ? parseInt(v.odometro_inicial, 10) : 0;
         const id_tipo_vehiculo = v.id_tipo_vehiculo || 2;
 
-       const fechaOperativaCierre = calcularFechaOperativa(fecha_evento, hora_alerta || "00:00", "FIN", id_tipo_vehiculo, turno);
+        const fechaOperativaCierre = calcularFechaOperativa(
+          fecha_evento,
+          hora_alerta || "00:00",
+          "FIN",
+          id_tipo_vehiculo,
+          turno
+        );
 
-        // A. BUSCAR EL INICIO ABIERTO PREVIO DESDE NODE.JS (Alineado con su fecha operativa y unidad)
+        // Busca el INICIO previo abierto que NO tenga ya un FIN posterior
         const [inicioPrevio] = await connection.query(
-          `SELECT odometro_inicial FROM ocurrencia_vehiculo_detalle 
-           WHERE id_unidad = ? 
-             AND odometro_inicial IS NOT NULL 
-             AND odometro_final IS NULL 
-             AND DATE(fecha_asignacion) <= ?
-           ORDER BY fecha_asignacion DESC LIMIT 1`,
+          `SELECT ini.odometro_inicial
+           FROM ocurrencia_vehiculo_detalle ini
+           WHERE ini.id_unidad = ?
+             AND ini.odometro_inicial IS NOT NULL
+             AND ini.odometro_final IS NULL
+             AND DATE(ini.fecha_asignacion) <= ?
+             AND NOT EXISTS (
+               SELECT 1
+               FROM ocurrencia_vehiculo_detalle fin
+               WHERE fin.id_unidad = ini.id_unidad
+                 AND fin.odometro_final IS NOT NULL
+                 AND fin.odometro_inicial IS NULL
+                 AND (
+                   fin.fecha_asignacion > ini.fecha_asignacion
+                   OR (fin.fecha_asignacion = ini.fecha_asignacion AND fin.id_detalle > ini.id_detalle)
+                 )
+             )
+           ORDER BY ini.fecha_asignacion DESC, ini.id_detalle DESC
+           LIMIT 1`,
           [id_unidad, fechaOperativaCierre]
         );
 
         let kilometraje_recorrido = null;
-        let estado_cierre = 'AUDITORIA_SOLO_FIN'; // Por defecto si no hay inicio previo
+        let estado_cierre = "AUDITORIA_SOLO_FIN";
 
         if (inicioPrevio.length > 0) {
-          const odomInicio = parseInt(inicioPrevio[0].odometro_inicial);
+          const odomInicio = parseInt(inicioPrevio[0].odometro_inicial, 10);
           kilometraje_recorrido = odometro_final_ingresado - odomInicio;
-
-          // B. EVALUAR LOS ENUMs OFICIALES DE AUDITORÍA
-          if (kilometraje_recorrido < 0) {
-            estado_cierre = 'AUDITORIA_ODOMETRO_NEGATIVO';
-          } else {
-            estado_cierre = 'REGISTRADO';
-          }
+          estado_cierre = kilometraje_recorrido < 0 ? "AUDITORIA_ODOMETRO_NEGATIVO" : "REGISTRADO";
         }
 
-        // C. INSERTAR YA CALCULADO EN LA BASE DE DATOS
         await connection.query(
           `INSERT INTO ocurrencia_vehiculo_detalle 
           (id_ocurrencia, id_tipo_vehiculo, id_unidad, odometro_final, kilometraje_recorrido, estado_cierre, fecha_asignacion) 
           VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [
-            id_nueva_ocurrencia, 
-            id_tipo_vehiculo, 
-            id_unidad, 
-            odometro_final_ingresado, 
+            id_nueva_ocurrencia,
+            id_tipo_vehiculo,
+            id_unidad,
+            odometro_final_ingresado,
             kilometraje_recorrido,
             estado_cierre,
-            `${fechaOperativaCierre} ${hora_alerta || '00:00:00'}`
+            `${fechaOperativaCierre} ${hora_alerta || "00:00:00"}`,
           ]
         );
-
-        console.log(`🏁 Vehículo ${id_unidad} finalizado. Odom Final: ${odometro_final_ingresado}, Recorrido: ${kilometraje_recorrido}, Estado: ${estado_cierre}`);
       }
     }
 
-    await connection.commit();
+    const { fotosYaSubidas, fotosPendientesSubir } = clasificarFotosRegistro(id_nueva_ocurrencia, fotos);
+    if (fotosYaSubidas.length > 0) {
+      await connection.query(
+        "INSERT INTO foto_ocurrencia_registro (id_ocurrencia, url_imagen, public_id) VALUES ?",
+        [fotosYaSubidas]
+      );
+    }
 
+    await connection.commit();
     res.status(201).json({
       success: true,
       message: "Servicio finalizado correctamente.",
       id: id_nueva_ocurrencia,
     });
 
-    if (fotos && Array.isArray(fotos) && fotos.length > 0) {
-      procesarYSubirFotosSegundoPlano(id_nueva_ocurrencia, fotos, db).catch(() => {});
+    if (fotosPendientesSubir.length > 0) {
+      procesarYSubirFotosSegundoPlano(
+        id_nueva_ocurrencia,
+        fotosPendientesSubir,
+        db,
+        id_modalidad,
+        fecha_evento
+      ).catch((err) => {
+        console.error("🔴 Error en segundo plano de fotos (finalizar-servicio):", err.message);
+      });
     }
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rbErr) {
+        console.error("🔴 Error en rollback:", rbErr.message);
+      }
+    }
     console.error("🔴 ERROR EN FIN DE SERVICIO:", error.message);
-    if (!res.headersSent) res.status(400).json({ success: false, error: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: "Error al finalizar servicio." });
+    }
   } finally {
     if (connection) connection.release();
   }
@@ -11056,13 +10720,6 @@ app.get("/api/vehiculo/monitoreo-unidades", async (req, res) => {
 
 
 
-// Configuración Cloudinary (Asegúrate de poner tus datos reales)
-cloudinary.config({
-  cloud_name: "dplwunlzp",
-  api_key: "515945841913642",
-  api_secret: "PrB-RTZFI0SaagSEkrIn80ieZiI",
-});
-// --- FUNCIÓN NÚCLEO DE MIGRACIÓN ---
 
 app.put("/ocurrencias/editar-sipcopse/:id_ocurrencia", async (req, res) => {
   let connection;
@@ -11535,9 +11192,6 @@ app.put("/ocurrencias/editarseguro-sipcop/:id_ocurrencia", async (req, res) => {
   let connection;
   try {
     const { id_ocurrencia } = req.params;
-
-    console.log("📥 REQ.BODY RECIBIDO:", JSON.stringify(req.body, null, 2));
-
     const {
       id_modalidad,
       id_resultado_real,
@@ -11550,78 +11204,41 @@ app.put("/ocurrencias/editarseguro-sipcop/:id_ocurrencia", async (req, res) => {
       id_medio,
       victimas,
       agresores,
-      estado, // <--- NUEVO CAMPO
-      patrimonio_real, // <--- NUEVO CAMPO
-      arresto_ciudadano, // <--- NUEVO CAMPO
-    } = req.body;
+      estado,
+      patrimonio_real,
+      arresto_ciudadano,
+    } = req.body || {};
 
-    // RESOLVER EL VALOR FINAL (Si no se manda el campo, toma null)
-    const finalModalidad =
-      id_modalidad !== undefined && id_modalidad !== "" ? id_modalidad : null;
-    const finalResultado =
-      id_resultado_real !== undefined ? id_resultado_real : id_resultado;
-    const finalConsecuencia =
-      id_consecuencia_real !== undefined
-        ? id_consecuencia_real
-        : id_consecuencia;
-    const finalLugar =
-      id_lugar_real !== undefined ? id_lugar_real : id_lugarsip;
+    const finalModalidad = id_modalidad !== undefined && id_modalidad !== "" ? id_modalidad : null;
+    const finalResultado = id_resultado_real !== undefined ? id_resultado_real : id_resultado;
+    const finalConsecuencia = id_consecuencia_real !== undefined ? id_consecuencia_real : id_consecuencia;
+    const finalLugar = id_lugar_real !== undefined ? id_lugar_real : id_lugarsip;
     const finalMedio = id_medio_real !== undefined ? id_medio_real : id_medio;
 
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-    // 1. VERIFICAR SI LA OCURRENCIA REALMENTE EXISTE
     const [rows] = await connection.query(
-      `SELECT id_ocurrencia FROM ocurrencia_registro WHERE id_ocurrencia = ?`,
-      [id_ocurrencia],
+      "SELECT id_ocurrencia FROM ocurrencia_registro WHERE id_ocurrencia = ?",
+      [id_ocurrencia]
     );
 
     if (!rows || rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "LA OCURRENCIA NO EXISTE",
-      });
+      await connection.rollback();
+      return res.status(404).json({ success: false, error: "LA OCURRENCIA NO EXISTE" });
     }
 
-    // 2. VALIDAR MODALIDAD SOLO SI EL USUARIO LA HA ENVIADO
     if (finalModalidad !== null) {
       const [modalidadRows] = await connection.query(
-        `SELECT id FROM cat_modalidad WHERE id = ?`,
-        [finalModalidad],
+        "SELECT id FROM cat_modalidad WHERE id = ?",
+        [finalModalidad]
       );
       if (!modalidadRows || modalidadRows.length === 0) {
-        return res.status(400).json({
-          success: false,
-          error: "LA MODALIDAD SELECCIONADA NO ES VÁLIDA",
-        });
+        await connection.rollback();
+        return res.status(400).json({ success: false, error: "LA MODALIDAD SELECCIONADA NO ES VÁLIDA" });
       }
     }
 
-    // PARÁMETROS PARA EL UPDATE PARCIAL
-    const paramsUpdate = [
-      finalModalidad,
-      finalResultado !== undefined && finalResultado !== ""
-        ? finalResultado
-        : null,
-      finalConsecuencia !== undefined && finalConsecuencia !== ""
-        ? finalConsecuencia
-        : null,
-      finalLugar !== undefined && finalLugar !== "" ? finalLugar : null,
-      finalMedio !== undefined && finalMedio !== "" ? finalMedio : null,
-      estado !== undefined && estado !== "" ? estado : null,
-      patrimonio_real !== undefined && patrimonio_real !== ""
-        ? patrimonio_real
-        : null,
-      arresto_ciudadano !== undefined && arresto_ciudadano !== ""
-        ? arresto_ciudadano
-        : null,
-      id_ocurrencia,
-    ];
-
-  
-
-    // 3. ACTUALIZAR USANDO COALESCE (SI EL NUEVO VALOR ES NULO, MANTIENE EL ANTERIOR)
     await connection.query(
       `UPDATE ocurrencia_registro 
        SET id_modalidad = COALESCE(?, id_modalidad), 
@@ -11634,70 +11251,61 @@ app.put("/ocurrencias/editarseguro-sipcop/:id_ocurrencia", async (req, res) => {
            arresto_ciudadano = COALESCE(?, arresto_ciudadano),
            fecha_ultima_edicion = NULL 
        WHERE id_ocurrencia = ?`,
-      paramsUpdate,
+      [
+        finalModalidad,
+        finalResultado !== undefined && finalResultado !== "" ? finalResultado : null,
+        finalConsecuencia !== undefined && finalConsecuencia !== "" ? finalConsecuencia : null,
+        finalLugar !== undefined && finalLugar !== "" ? finalLugar : null,
+        finalMedio !== undefined && finalMedio !== "" ? finalMedio : null,
+        estado !== undefined && estado !== "" ? estado : null,
+        patrimonio_real !== undefined && patrimonio_real !== "" ? patrimonio_real : null,
+        arresto_ciudadano !== undefined && arresto_ciudadano !== "" ? arresto_ciudadano : null,
+        id_ocurrencia,
+      ]
     );
 
-    // 4. GESTIÓN DE VÍCTIMAS
     if (Array.isArray(victimas)) {
-      await connection.query(
-        `DELETE FROM detalle_victimas_ocurrencia WHERE id_ocurrencia = ?`,
-        [id_ocurrencia],
-      );
+      await connection.query("DELETE FROM detalle_victimas_ocurrencia WHERE id_ocurrencia = ?", [id_ocurrencia]);
       if (victimas.length > 0) {
-        for (const vic of victimas) {
-          await connection.query(
-            `INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, placa_victima, edad, id_relacion_v) 
-             VALUES (?, ?, ?, ?, ?)`,
-            [
-              id_ocurrencia,
-              vic.nombre_victima || null,
-              vic.placa_victima || null,
-              vic.edad || null,
-              vic.id_relacion_v || null,
-            ],
-          );
-        }
+        const valuesVic = victimas.map((vic) => [
+          id_ocurrencia,
+          vic.nombre_victima || null,
+          vic.placa_victima || null,
+          vic.edad || null,
+          vic.id_relacion_v || null,
+        ]);
+        await connection.query(
+          "INSERT INTO detalle_victimas_ocurrencia (id_ocurrencia, nombre_victima, placa_victima, edad, id_relacion_v) VALUES ?",
+          [valuesVic]
+        );
       }
     }
-    // graficos
 
-    // 5. GESTIÓN DE AGRESORES
     if (Array.isArray(agresores)) {
-      await connection.query(
-        `DELETE FROM detalle_agresores_ocurrencia WHERE id_ocurrencia = ?`,
-        [id_ocurrencia],
-      );
+      await connection.query("DELETE FROM detalle_agresores_ocurrencia WHERE id_ocurrencia = ?", [id_ocurrencia]);
       if (agresores.length > 0) {
-        for (const agr of agresores) {
-          await connection.query(
-            `INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, placa_agresor, edad) 
-             VALUES (?, ?, ?, ?)`,
-            [
-              id_ocurrencia,
-              agr.nombre_agresor || null,
-              agr.placa_agresor || null,
-              agr.edad || null,
-            ],
-          );
-        }
+        const valuesAgr = agresores.map((agr) => [
+          id_ocurrencia,
+          agr.nombre_agresor || null,
+          agr.placa_agresor || null,
+          agr.edad || null,
+        ]);
+        await connection.query(
+          "INSERT INTO detalle_agresores_ocurrencia (id_ocurrencia, nombre_agresor, placa_agresor, edad) VALUES ?",
+          [valuesAgr]
+        );
       }
     }
 
     await connection.commit();
-    console.log(
-      "✅ TRANSACCIÓN EXITOSA: REGISTRO ACTUALIZADO DE FORMA PERSISTENTE.",
-    );
-    return res.status(200).json({
-      success: true,
-      message: "REGISTRO ACTUALIZADO CORRECTAMENTE",
-    });
+    ocurrenciasCacheVersion++;
+    return res.status(200).json({ success: true, message: "REGISTRO ACTUALIZADO CORRECTAMENTE" });
   } catch (error) {
-    if (connection) await connection.rollback();
-    console.error("🔴 ERROR CRÍTICO AL EDITAR OCURRENCIA:", error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message.toUpperCase(),
-    });
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error("🔴 ERROR AL EDITAR OCURRENCIA:", error.message);
+    return res.status(500).json({ success: false, error: error.message.toUpperCase() });
   } finally {
     if (connection) connection.release();
   }
@@ -11763,88 +11371,91 @@ const getFiltroDinamico = (req) => {
 
   return { filtro, params };
 };
-*/
-app.get("/ocurrencias/catalogos-filtros", async (req, res) => {
-  let connection;
+*/app.get("/ocurrencias/catalogos-filtros", async (req, res) => {
   try {
-    connection = await db.getConnection();
-    const [origenes] = await connection.query("SELECT id_origen, descripcion FROM origen");
-    const [tiposPatrullaje] = await connection.query("SELECT id_tipop, nombre FROM tipo_patrullaje");
-    
-    res.json({
-      success: true,
-      origenes,
-      tipos_patrullaje: tiposPatrullaje
+    const data = await obtenerConCache("cat_filtros_estadisticas", async () => {
+      const [[origenes], [tiposPatrullaje]] = await Promise.all([
+        db.query("SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC"),
+        db.query("SELECT id_tipop, nombre FROM tipo_patrullaje ORDER BY nombre ASC"),
+      ]);
+      return {
+        success: true,
+        origenes,
+        tipos_patrullaje: tiposPatrullaje,
+      };
     });
+    res.json(data);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    if (connection) connection.release();
   }
 });
+
+// Helper optimizado en Node (hora Perú exacta + query indexable sin ORs ni CURDATE UTC)
 const getFiltroDinamico = (req) => {
   const { id_origen, id_tipop, id_tipo_vehiculo, excluir_origenes, excluir_tipo_vehiculo } = req.query;
 
-  let filtro = "";
-  let params = [];
+  const ahoraLima = obtenerFechaHoraPeru(new Date());
+  const ayerLima = obtenerFechaHoraPeru(new Date(Date.now() - 24 * 60 * 60 * 1000));
+  const horaActual = ahoraLima.fechaHora.split(" ")[1]; // "HH:MM:SS"
+  const esMotos = String(id_tipo_vehiculo) === "2";
 
-  const esMotos = String(id_tipo_vehiculo) === '2';
+  let fechaTurno = ahoraLima.fecha;
+  let turnoLetra = "N";
 
   if (esMotos) {
-    filtro = `
-      WHERE (
-        (CURRENT_TIME() >= '06:00:00' AND CURRENT_TIME() < '14:00:00' AND o.fecharm = CURDATE() AND o.turnrm = 'M')
-        OR
-        (CURRENT_TIME() >= '14:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fecharm = CURDATE() AND o.turnrm = 'T')
-        OR
-        (CURRENT_TIME() >= '22:00:00' AND o.fecharm = CURDATE() AND o.turnrm = 'N')
-        OR
-        (CURRENT_TIME() < '06:00:00' AND o.fecharm = CURDATE() - INTERVAL 1 DAY AND o.turnrm = 'N')
-      )
-    `; // 👈 ELIMINAMOS EL "AND CONCAT(...) <= NOW()" AQUí
+    if (horaActual >= "06:00:00" && horaActual < "14:00:00") turnoLetra = "M";
+    else if (horaActual >= "14:00:00" && horaActual < "22:00:00") turnoLetra = "T";
+    else {
+      turnoLetra = "N";
+      if (horaActual < "06:00:00") fechaTurno = ayerLima.fecha;
+    }
   } else {
-    filtro = `
-      WHERE (
-        (CURRENT_TIME() >= '07:00:00' AND CURRENT_TIME() < '15:00:00' AND o.fechar = CURDATE() AND o.turnr = 'M')
-        OR
-        (CURRENT_TIME() >= '15:00:00' AND CURRENT_TIME() < '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'T')
-        OR
-        (CURRENT_TIME() >= '22:00:00' AND o.fechar = CURDATE() AND o.turnr = 'N')
-        OR
-        (CURRENT_TIME() < '07:00:00' AND o.fechar = CURDATE() - INTERVAL 1 DAY AND o.turnr = 'N')
-      )
-    `; // 👈 Y AQUí TAMBIÉN
+    if (horaActual >= "07:00:00" && horaActual < "15:00:00") turnoLetra = "M";
+    else if (horaActual >= "15:00:00" && horaActual < "22:00:00") turnoLetra = "T";
+    else {
+      turnoLetra = "N";
+      if (horaActual < "07:00:00") fechaTurno = ayerLima.fecha;
+    }
   }
 
-  // Resto de tus filtros normales...
-  if (id_origen && id_origen !== 'TODOS') {
-    filtro += ` AND o.id_origen = ? `;
+  let filtro = esMotos
+    ? "WHERE o.fecharm = ? AND o.turnrm = ?"
+    : "WHERE o.fechar = ? AND o.turnr = ?";
+  const params = [fechaTurno, turnoLetra];
+
+  if (id_origen && id_origen !== "TODOS") {
+    filtro += " AND o.id_origen = ?";
     params.push(id_origen);
   }
-if (excluir_origenes) {
-    const idsExcluir = excluir_origenes.split(',').map(id => Number(id.trim())).filter(Boolean);
+
+  if (excluir_origenes) {
+    const idsExcluir = String(excluir_origenes)
+      .split(",")
+      .map((id) => Number(id.trim()))
+      .filter((n) => !Number.isNaN(n) && n > 0);
     if (idsExcluir.length > 0) {
-      filtro += ` AND o.id_origen NOT IN (${idsExcluir.map(() => '?').join(',')}) `;
+      filtro += ` AND o.id_origen NOT IN (${idsExcluir.map(() => "?").join(",")})`;
       params.push(...idsExcluir);
     }
   }
 
-  if (id_tipop && id_tipop !== 'TODOS') {
-    filtro += ` AND o.id_tipop = ? `;
+  if (id_tipop && id_tipop !== "TODOS") {
+    filtro += " AND o.id_tipop = ?";
     params.push(id_tipop);
   }
 
-  // 🛠️ Corrección: Usar 'ov_filtro' en lugar de 'ov'
-  if (id_tipo_vehiculo && id_tipo_vehiculo !== 'TODOS') {
-    filtro += ` AND ov_filtro.id_tipo_vehiculo = ? `;
+  if (id_tipo_vehiculo && id_tipo_vehiculo !== "TODOS") {
+    filtro += " AND ov_filtro.id_tipo_vehiculo = ?";
     params.push(id_tipo_vehiculo);
   }
 
-  // 🛠️ Corrección: Usar 'ov_filtro' en lugar de 'ov'
   if (excluir_tipo_vehiculo) {
-    const tiposExcluir = excluir_tipo_vehiculo.split(',').map(id => Number(id.trim())).filter(Boolean);
+    const tiposExcluir = String(excluir_tipo_vehiculo)
+      .split(",")
+      .map((id) => Number(id.trim()))
+      .filter((n) => !Number.isNaN(n) && n > 0);
     if (tiposExcluir.length > 0) {
-      filtro += ` AND (ov_filtro.id_tipo_vehiculo NOT IN (${tiposExcluir.map(() => '?').join(',')}) OR ov_filtro.id_tipo_vehiculo IS NULL) `;
+      filtro += ` AND (ov_filtro.id_tipo_vehiculo NOT IN (${tiposExcluir.map(() => "?").join(",")}) OR ov_filtro.id_tipo_vehiculo IS NULL)`;
       params.push(...tiposExcluir);
     }
   }
@@ -11852,101 +11463,112 @@ if (excluir_origenes) {
   return { filtro, params };
 };
 
-// Estadísticas generales para las tarjetas (con el JOIN necesario para el filtro de vehículo)
 app.get("/ocurrencias/estadisticas", async (req, res) => {
-  let connection;
   try {
-    connection = await db.getConnection();
-    const { filtro, params } = getFiltroDinamico(req);
+    const cacheKey = `est_turno_${JSON.stringify(req.query)}`;
 
-    const sqlUsuarios = `
-      SELECT 
-        us.id_usuario AS id,
-        COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS label,
-        COUNT(o.id_ocurrencia) AS value
-      FROM ocurrencia_registro o
-      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
-      LEFT JOIN persona p ON us.id_persona = p.id_persona
-      LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
-      ${filtro}
-      GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres
-      ORDER BY value DESC;
-    `;
+    const data = await obtenerConCache(
+      cacheKey,
+      async () => {
+        const { filtro, params } = getFiltroDinamico(req);
 
-    const sqlModalidades = `
-      SELECT 
-        COALESCE(m.nombre, 'Sin modalidad') AS label,
-        COUNT(o.id_ocurrencia) AS value
-      FROM ocurrencia_registro o
-      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-      LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
-      ${filtro}
-      GROUP BY m.id, m.nombre
-      ORDER BY value DESC;
-    `;
+        const sqlUsuarios = `
+          SELECT 
+            us.id_usuario AS id,
+            COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS label,
+            COUNT(DISTINCT o.id_ocurrencia) AS value
+          FROM ocurrencia_registro o
+          LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario 
+          LEFT JOIN persona p ON us.id_persona = p.id_persona
+          LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
+          ${filtro}
+          GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres
+          ORDER BY value DESC
+        `;
 
-    const [usuariosRows] = await connection.query(sqlUsuarios, params);
-    const [modalidadesRows] = await connection.query(sqlModalidades, params);
+        if (req.query.solo_usuarios === "1") {
+          const [usuariosRows] = await db.query(sqlUsuarios, params);
+          return { success: true, por_usuario: usuariosRows, por_modalidad: [] };
+        }
 
-    res.json({ success: true, por_usuario: usuariosRows, por_modalidad: modalidadesRows });
+        const sqlModalidades = `
+          SELECT 
+            COALESCE(m.nombre, 'Sin modalidad') AS label,
+            COUNT(DISTINCT o.id_ocurrencia) AS value
+          FROM ocurrencia_registro o
+          LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+          LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
+          ${filtro}
+          GROUP BY m.id, m.nombre
+          ORDER BY value DESC
+        `;
+
+        const [[usuariosRows], [modalidadesRows]] = await Promise.all([
+          db.query(sqlUsuarios, params),
+          db.query(sqlModalidades, params),
+        ]);
+
+        return { success: true, por_usuario: usuariosRows, por_modalidad: modalidadesRows };
+      },
+      15 * 1000 // Caché corto de 15s (casi tiempo real, evita saturación al refrescar)
+    );
+
+    res.json(data);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    if (connection) connection.release();
   }
 });
 
 app.get("/ocurrencias/modalidades-por-usuario", async (req, res) => {
-  const { id_usuario } = req.query; 
-  if (!id_usuario) return res.status(400).json({ success: false, error: "Falta id_usuario" });
+  const { id_usuario } = req.query;
+  if (!id_usuario) {
+    return res.status(400).json({ success: false, error: "Falta id_usuario" });
+  }
 
-  let connection;
   try {
-    connection = await db.getConnection();
     const { filtro, params } = getFiltroDinamico(req);
-    const [rows] = await connection.query(`
-      SELECT COALESCE(m.nombre, 'Sin modalidad') AS modalidad, COUNT(o.id_ocurrencia) AS cantidad
-      FROM ocurrencia_registro o
-      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-      LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
-      ${filtro} AND o.id_usuario = ?
-      GROUP BY m.id, m.nombre ORDER BY cantidad DESC;
-    `, [...params, id_usuario]);
+    const [rows] = await db.query(
+      `SELECT COALESCE(m.nombre, 'Sin modalidad') AS modalidad, COUNT(DISTINCT o.id_ocurrencia) AS cantidad
+       FROM ocurrencia_registro o
+       LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+       LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
+       ${filtro} AND o.id_usuario = ?
+       GROUP BY m.id, m.nombre
+       ORDER BY cantidad DESC`,
+      [...params, id_usuario]
+    );
     res.json({ success: true, modalidades: rows });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    if (connection) connection.release();
   }
 });
 
 app.get("/ocurrencias/detalle-por-modalidad", async (req, res) => {
   const { id_usuario, modalidad } = req.query;
-  if (!id_usuario || !modalidad) return res.status(400).json({ success: false, error: "Faltan parámetros" });
+  if (!id_usuario || !modalidad) {
+    return res.status(400).json({ success: false, error: "Faltan parámetros" });
+  }
 
-  let connection;
   try {
-    connection = await db.getConnection();
     const { filtro, params } = getFiltroDinamico(req);
-    const [rows] = await connection.query(`
-      SELECT 
-        COALESCE(m.nombre, 'Sin modalidad') AS MODALIDAD, 
-        COALESCE(TRIM(l.nombre_lugar), 'Sin dirección registrada') AS DIRECCIÓN_CONSOLIDADA,
-        COUNT(o.id_ocurrencia) AS CANTIDAD
-      FROM ocurrencia_registro o 
-      LEFT JOIN lugar l ON o.id_lugar = l.id_lugar 
-      LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-      LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
-      ${filtro} AND o.id_usuario = ?
-      AND (TRIM(m.nombre) = TRIM(?) OR (? = 'Sin modalidad' && m.nombre IS NULL))
-      GROUP BY COALESCE(TRIM(l.nombre_lugar), 'Sin dirección registrada'), m.nombre
-      ORDER BY CANTIDAD DESC;
-    `, [...params, id_usuario, modalidad, modalidad]);
+    const [rows] = await db.query(
+      `SELECT 
+         COALESCE(m.nombre, 'Sin modalidad') AS MODALIDAD, 
+         COALESCE(TRIM(l.nombre_lugar), 'Sin dirección registrada') AS DIRECCIÓN_CONSOLIDADA,
+         COUNT(DISTINCT o.id_ocurrencia) AS CANTIDAD
+       FROM ocurrencia_registro o 
+       LEFT JOIN lugar l ON o.id_lugar = l.id_lugar 
+       LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+       LEFT JOIN ocurrencia_vehiculo_detalle ov_filtro ON o.id_ocurrencia = ov_filtro.id_ocurrencia
+       ${filtro} AND o.id_usuario = ?
+       AND (TRIM(m.nombre) = TRIM(?) OR (? = 'Sin modalidad' AND m.nombre IS NULL))
+       GROUP BY COALESCE(TRIM(l.nombre_lugar), 'Sin dirección registrada'), m.nombre
+       ORDER BY CANTIDAD DESC`,
+      [...params, id_usuario, modalidad, modalidad]
+    );
     res.json({ success: true, direcciones: rows });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    if (connection) connection.release();
   }
 });
 
@@ -12015,153 +11637,169 @@ app.get("/ocurrencias/detalle-por-vehiculo", async (req, res) => {
 
 
 app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
-  let connection;
   try {
-    connection = await db.getConnection();
+    const { fechaHora } = obtenerFechaHoraPeru();
+    const [anioActualStr, mesActualStr] = fechaHora.split(" ")[0].split("-");
 
-    const mes = req.query.mes || new Date().getMonth() + 1;
-    const anio = req.query.anio || new Date().getFullYear();
-    const idModalidad = req.query.id_modalidad;
-    const idOrigen = req.query.id_origen;
-    const modo = req.query.modo || "turnos";
-    const busqueda = req.query.busqueda || "";
-    
-    const limit = parseInt(req.query.limit) || 10;
-    const page = parseInt(req.query.page) || 1;
-    const offset = (page - 1) * limit;
+    const mesNum = Math.min(Math.max(1, parseInt(req.query.mes, 10) || Number(mesActualStr)), 12);
+    const anioNum = Math.min(Math.max(2020, parseInt(req.query.anio, 10) || Number(anioActualStr)), 2100);
+
+    const idModalidad = req.query.id_modalidad ? parseInt(req.query.id_modalidad, 10) : null;
+    const idOrigen = req.query.id_origen ? parseInt(req.query.id_origen, 10) : null;
+    const modo = req.query.modo === "normal" ? "normal" : "turnos";
+    const busqueda = String(req.query.busqueda || "").trim();
+
+    const limitNum = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 200), 500);
+    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const offsetNum = (pageNum - 1) * limitNum;
 
     const campoFecha = modo === "normal" ? "o.fecha_evento" : "o.fechar";
 
-    let whereClause = `WHERE MONTH(${campoFecha}) = ? AND YEAR(${campoFecha}) = ?`;
-    let queryParams = [mes, anio];
+    // Rango indexable (>= inicio de mes y < inicio del mes siguiente)
+    const fechaInicio = `${anioNum}-${String(mesNum).padStart(2, "0")}-01`;
+    const nextMes = mesNum === 12 ? 1 : mesNum + 1;
+    const nextAnio = mesNum === 12 ? anioNum + 1 : anioNum;
+    const fechaFin = `${nextAnio}-${String(nextMes).padStart(2, "0")}-01`;
 
-    if (idModalidad) {
-      whereClause += ` AND o.id_modalidad = ?`;
-      queryParams.push(idModalidad);
-    }
+    const cacheKey = `est_m3_${modo}_${anioNum}_${mesNum}_${idModalidad || "all"}_${idOrigen || "all"}_${limitNum}_${pageNum}_${busqueda.toLowerCase()}`;
 
-    if (idOrigen) {
-      whereClause += ` AND o.id_origen = ?`;
-      queryParams.push(idOrigen);
-    }
+    const [modalidadesRows, origenesRows, datosEstadisticos] = await Promise.all([
+      obtenerConCache("cat_modalidades_est", async () => {
+        const [r] = await db.query("SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC");
+        return r;
+      }),
+      obtenerConCache("cat_origenes_est", async () => {
+        const [r] = await db.query("SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC");
+        return r;
+      }),
+      obtenerConCache(
+        cacheKey,
+        async () => {
+          let whereClause = `WHERE ${campoFecha} >= ? AND ${campoFecha} < ?`;
+          const queryParams = [fechaInicio, fechaFin];
 
-    // Filtro dinámico por nombre o apellidos del personal
-    let searchClause = "";
-    let searchParams = [];
-    if (busqueda.trim() !== "") {
-      searchClause = ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) LIKE ?)`;
-      const termino = `%${busqueda.trim()}%`;
-      searchParams = [termino, termino, termino, termino];
-    }
+          if (idModalidad && !Number.isNaN(idModalidad)) {
+            whereClause += ` AND o.id_modalidad = ?`;
+            queryParams.push(idModalidad);
+          }
 
-    // 1. Evolución diaria
-    const sqlDiarioTurnos = `
-      SELECT 
-        DAY(${campoFecha}) AS dia,
-        o.turnr AS turno,
-        COUNT(o.id_ocurrencia) AS total
-      FROM ocurrencia_registro o
-      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      LEFT JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause} AND o.turnr IN ('M', 'T', 'N')
-      GROUP BY DAY(${campoFecha}), o.turnr
-      ORDER BY dia ASC, FIELD(o.turnr, 'M', 'T', 'N');
-    `;
+          if (idOrigen && !Number.isNaN(idOrigen)) {
+            whereClause += ` AND o.id_origen = ?`;
+            queryParams.push(idOrigen);
+          }
 
-    // 2. Paginación de usuarios por rendimiento total (De mayor a menor)
-    const limitNum = parseInt(limit, 10) || 10;
-    const offsetNum = parseInt(offset, 10) || 0;
-    
-    const sqlPaginarUsuarios = `
-      SELECT us.id_usuario, COUNT(o.id_ocurrencia) AS total_ocurrencias
-      FROM ocurrencia_registro o
-      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause}
-      GROUP BY us.id_usuario
-      ORDER BY total_ocurrencias DESC, us.id_usuario ASC
-      LIMIT ? OFFSET ?;
-    `;
+          let searchClause = "";
+          let searchParams = [];
+          if (busqueda !== "") {
+            searchClause = ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) LIKE ?)`;
+            const termino = `%${busqueda}%`;
+            searchParams = [termino, termino, termino, termino];
+          }
 
-    const [paginatedUsersRows] = await connection.query(
-      sqlPaginarUsuarios,
-      [...queryParams, ...searchParams, limitNum, offsetNum]
-    );
+          const sqlDiarioTurnos = `
+            SELECT 
+              DAY(${campoFecha}) AS dia,
+              o.turnr AS turno,
+              COUNT(o.id_ocurrencia) AS total
+            FROM ocurrencia_registro o
+            ${searchClause ? "LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario LEFT JOIN persona p ON us.id_persona = p.id_persona" : ""}
+            ${whereClause} ${searchClause} AND o.turnr IN ('M', 'T', 'N')
+            GROUP BY DAY(${campoFecha}), o.turnr
+            ORDER BY dia ASC, FIELD(o.turnr, 'M', 'T', 'N')
+          `;
 
-    const userIds = paginatedUsersRows.map(row => row.id_usuario);
+          const sqlPaginarUsuarios = `
+            SELECT us.id_usuario, COUNT(o.id_ocurrencia) AS total_ocurrencias
+            FROM ocurrencia_registro o
+            JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+            JOIN persona p ON us.id_persona = p.id_persona
+            ${whereClause} ${searchClause}
+            GROUP BY us.id_usuario
+            ORDER BY total_ocurrencias DESC, us.id_usuario ASC
+            LIMIT ? OFFSET ?
+          `;
 
-    // Contar el total de usuarios únicos con estos filtros y búsqueda
-    const sqlTotalUsuarios = `
-      SELECT COUNT(DISTINCT o.id_usuario) AS total_usuarios
-      FROM ocurrencia_registro o
-      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause};
-    `;
-    const [totalUsersRows] = await connection.query(sqlTotalUsuarios, [...queryParams, ...searchParams]);
-    const totalUsuariosCount = totalUsersRows[0]?.total_usuarios || 0;
+          const sqlTotalUsuarios = `
+            SELECT COUNT(DISTINCT o.id_usuario) AS total_usuarios
+            FROM ocurrencia_registro o
+            JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+            JOIN persona p ON us.id_persona = p.id_persona
+            ${whereClause} ${searchClause}
+          `;
 
-    let matrizRows = [];
-    if (userIds.length > 0) {
-      const placeholders = userIds.map(() => '?').join(',');
-      const sqlMatrizUsuarios = `
-        SELECT 
-          COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
-          DAY(${campoFecha}) AS dia,
-          o.turnr AS turno,
-          o.id_modalidad,
-          COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
-          COALESCE(ori.descripcion, 'SIN ORIGEN') AS origen_descripcion,
-          COUNT(o.id_ocurrencia) AS total
-        FROM ocurrencia_registro o
-        LEFT JOIN origen ori ON o.id_origen = ori.id_origen
-        LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-        LEFT JOIN persona p ON us.id_persona = p.id_persona
-        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-        ${whereClause} ${searchClause} AND o.id_usuario IN (${placeholders})
-        GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(${campoFecha}), o.turnr, o.id_modalidad, m.nombre, ori.descripcion
-        ORDER BY usuario ASC;
-      `;
-      const [rows] = await connection.query(sqlMatrizUsuarios, [...queryParams, ...searchParams, ...userIds]);
-      matrizRows = rows;
-    }
+          const sqlTotalesMes = `
+            SELECT 
+              COUNT(o.id_ocurrencia) AS total_mes,
+              SUM(CASE WHEN o.turnr = 'M' THEN 1 ELSE 0 END) AS total_mañana,
+              SUM(CASE WHEN o.turnr = 'T' THEN 1 ELSE 0 END) AS total_tarde,
+              SUM(CASE WHEN o.turnr = 'N' THEN 1 ELSE 0 END) AS total_noche
+            FROM ocurrencia_registro o
+            ${searchClause ? "LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario JOIN persona p ON us.id_persona = p.id_persona" : ""}
+            ${whereClause} ${searchClause}
+          `;
 
-    // 3. Totales generales del mes
-    const sqlTotalesMes = `
-      SELECT 
-        COUNT(o.id_ocurrencia) AS total_mes,
-        SUM(CASE WHEN o.turnr = 'M' THEN 1 ELSE 0 END) AS total_mañana,
-        SUM(CASE WHEN o.turnr = 'T' THEN 1 ELSE 0 END) AS total_tarde,
-        SUM(CASE WHEN o.turnr = 'N' THEN 1 ELSE 0 END) AS total_noche
-      FROM ocurrencia_registro o
-      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause};
-    `;
+          const allParams = [...queryParams, ...searchParams];
 
-    // 4. Catálogos (Modalidades y Orígenes)
-    const [modalidadesRows] = await connection.query(`SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC`);
-    const [origenesRows] = await connection.query(`SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC`); // <--- Agregado
-    
-    const [diarioRows] = await connection.query(sqlDiarioTurnos, [...queryParams, ...searchParams]);
-    const [totalesRows] = await connection.query(sqlTotalesMes, [...queryParams, ...searchParams]);
+          const [[paginatedUsersRows], [totalUsersRows], [diarioRows], [totalesRows]] =
+            await Promise.all([
+              db.query(sqlPaginarUsuarios, [...allParams, limitNum, offsetNum]),
+              db.query(sqlTotalUsuarios, allParams),
+              db.query(sqlDiarioTurnos, allParams),
+              db.query(sqlTotalesMes, allParams),
+            ]);
 
-    res.json({
+          const userIds = paginatedUsersRows.map((row) => row.id_usuario);
+          let matrizRows = [];
+
+          if (userIds.length > 0) {
+            const placeholders = userIds.map(() => "?").join(",");
+            const sqlMatrizUsuarios = `
+              SELECT 
+                COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
+                DAY(${campoFecha}) AS dia,
+                o.turnr AS turno,
+                o.id_modalidad,
+                COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
+                COUNT(o.id_ocurrencia) AS total
+              FROM ocurrencia_registro o
+              LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+              LEFT JOIN persona p ON us.id_persona = p.id_persona
+              LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+              ${whereClause} AND o.id_usuario IN (${placeholders})
+              GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(${campoFecha}), o.turnr, o.id_modalidad, m.nombre
+              ORDER BY usuario ASC
+            `;
+            const [rows] = await db.query(sqlMatrizUsuarios, [...queryParams, ...userIds]);
+            matrizRows = rows;
+          }
+
+          return {
+            evolucion_diaria_turnos: diarioRows,
+            matriz_usuarios: matrizRows,
+            total_usuarios_count: totalUsersRows[0]?.total_usuarios || 0,
+            totales_mes: totalesRows[0] || {
+              total_mes: 0,
+              total_mañana: 0,
+              total_tarde: 0,
+              total_noche: 0,
+            },
+          };
+        },
+        60 * 1000 // Caché 60s para el dashboard
+      ),
+    ]);
+
+    return res.json({
       success: true,
       modo_usado: modo,
       campo_fecha_usado: campoFecha,
-      evolucion_diaria_turnos: diarioRows,
-      matriz_usuarios: matrizRows,
-      total_usuarios_count: totalUsuariosCount,
-      totales_mes: totalesRows[0] || { total_mes: 0, total_mañana: 0, total_tarde: 0, total_noche: 0 },
+      ...datosEstadisticos,
       modalidades_catalogo: modalidadesRows,
-      origenes_catalogo: origenesRows, // <--- Enviado al frontend
+      origenes_catalogo: origenesRows,
     });
   } catch (error) {
     console.error("ERROR EN /ocurrencias/estadisticas-mensuales3:", error);
-    res.status(500).json({ success: false, error: error.message });
-  } finally {
-    if (connection) connection.release();
+    return res.status(500).json({ success: false, error: "Error interno al cargar estadísticas." });
   }
 });
 
@@ -12495,96 +12133,100 @@ let cacheMapaCompleto = {
 const CACHE_TTL_MAPA = 10 * 60 * 1000; // 10 minutos de caché
 
 app.get("/mapa-completo", async (req, res) => {
-  const ahora = Date.now();
-
-  // 1. Si la caché sigue vigente, la entregamos al instante sin tocar MySQL
-  if (cacheMapaCompleto.data && (ahora - cacheMapaCompleto.timestamp < CACHE_TTL_MAPA)) {
-    console.log("[CACHÉ] Entregando /mapa-completo desde memoria RAM (Cero carga en MySQL)");
-    return res.json(cacheMapaCompleto.data);
-  }
-
   try {
-    // 1. Obtener los polígonos de la PNP
-    const queryPoligonos = `
-      SELECT 
-        nombre_cuadrante as nombre, 
-        ST_AsGeoJSON(ST_Simplify(area_poligono, 0.0001)) as geometria, 
-        'pnp' as fuente 
-      FROM pnp_poligono_gis
-    `;
-    const [poligonos] = await db.query(queryPoligonos);
+    const respuestaFinal = await obtenerConCache(
+      "mapa_completo_gis",
+      async () => {
+        const [[poligonos], [puntos], [camaras]] = await Promise.all([
+          db.query(`
+            SELECT nombre_cuadrante as nombre, ST_AsGeoJSON(ST_Simplify(area_poligono, 0.0001)) as geometria, 'pnp' as fuente 
+            FROM pnp_poligono_gis
+          `),
+          db.query(`
+            SELECT l.id_lugar AS id, l.nombre_lugar, l.direccion, l.latitud, l.longitud, 
+                   pnc.codigo_cuadrante AS id_pnp_cuadrante, tl.nombre_tipo AS tipo_lugar
+            FROM lugar l
+            INNER JOIN tipos_lugar tl ON tl.id_tipo = l.id_tipo_lugar 
+            INNER JOIN pnp_cuadrante AS pnc ON pnc.id_pnp_cuadrante = l.id_pnp_cuadrante
+            WHERE l.estado = 1 AND l.latitud IS NOT NULL AND l.longitud IS NOT NULL AND l.id_tipo_lugar IN (1, 2, 3)
+          `),
+          db.query(`
+            SELECT c.id_camara AS id, c.codigo_camara, c.nombre_camara, c.ubicacion_referencia AS direccion,
+                   c.lat AS latitud, c.lon AS longitud, pnc.codigo_cuadrante AS id_pnp_cuadrante, c.proveedor,
+                   'CÁMARA DE VIDEO' AS tipo_lugar
+            FROM camara c
+            LEFT JOIN pnp_cuadrante AS pnc ON pnc.id_pnp_cuadrante = c.id_pnp_cuadrante
+            WHERE c.estado = 1 AND c.lat IS NOT NULL AND c.lon IS NOT NULL
+          `),
+        ]);
 
-    // 2. Obtener los lugares
-    const queryPuntos = `
-      SELECT 
-        l.id_lugar AS id, 
-        l.nombre_lugar, 
-        l.direccion, 
-        l.latitud, 
-        l.longitud, 
-        pnc.codigo_cuadrante AS id_pnp_cuadrante, 
-        tl.nombre_tipo AS tipo_lugar
-      FROM lugar l
-      INNER JOIN tipos_lugar tl ON tl.id_tipo = l.id_tipo_lugar 
-      INNER JOIN pnp_cuadrante AS pnc ON pnc.id_pnp_cuadrante = l.id_pnp_cuadrante
-      WHERE l.estado = 1 
-        AND l.latitud IS NOT NULL 
-        AND l.longitud IS NOT NULL 
-        AND l.id_tipo_lugar IN (1, 2, 3);
-    `;
-    const [puntos] = await db.query(queryPuntos);
+        const poligonosParseados = poligonos.map((fila) => ({
+          ...fila,
+          geometria: typeof fila.geometria === "string" ? JSON.parse(fila.geometria) : fila.geometria,
+        }));
 
-    // 3. Obtener las cámaras
-    const queryCamaras = `
-      SELECT 
-        c.id_camara AS id,
-        c.codigo_camara,
-        c.nombre_camara, 
-        c.ubicacion_referencia AS direccion,
-        c.lat AS latitud,
-        c.lon AS longitud,
-        pnc.codigo_cuadrante AS id_pnp_cuadrante,
-        c.proveedor,
-        'CÁMARA DE VIDEO' AS tipo_lugar
-      FROM camara c
-      LEFT JOIN pnp_cuadrante AS pnc ON pnc.id_pnp_cuadrante = c.id_pnp_cuadrante
-      WHERE c.estado = 1 
-        AND c.lat IS NOT NULL 
-        AND c.lon IS NOT NULL;
-    `;
-    const [camaras] = await db.query(queryCamaras);
+        const camarasFormateadas = camaras.map((c) => ({
+          ...c,
+          nombre_lugar: `Cámara: ${c.nombre_camara || c.codigo_camara} (${c.proveedor || "S/P"})`,
+        }));
 
-    // Parsear geometrías de polígonos
-    const poligonosParseados = poligonos.map((fila) => ({
-      ...fila,
-      geometria: typeof fila.geometria === "string" ? JSON.parse(fila.geometria) : fila.geometria,
-    }));
+        return {
+          poligonos: poligonosParseados,
+          puntos: [...puntos, ...camarasFormateadas],
+        };
+      },
+      10 * 60 * 1000
+    );
 
-    // Formatear cámaras para que unifiquen sus nombres correctamente
-    const camarasFormateadas = camaras.map(c => ({
-      ...c,
-      nombre_lugar: `Cámara: ${c.nombre_camara || c.codigo_camara} (${c.proveedor || 'S/P'})`
-    }));
-
-    const respuestaFinal = {
-      poligonos: poligonosParseados,
-      puntos: [...puntos, ...camarasFormateadas]
-    };
-
-    // 2. Guardar en la caché antes de responder
-    cacheMapaCompleto = {
-      data: respuestaFinal,
-      timestamp: ahora
-    };
-
-    console.log("[MYSQL] Consultando base de datos para /mapa-completo");
     res.json(respuestaFinal);
-
   } catch (error) {
     console.error("Error en /mapa-completo:", error);
     res.status(500).json({ error: error.message });
   }
 });
+
+// Middleware global para devolver JSON limpio ante errores de Multer, JSON inválido o errores no controlados
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        success: false,
+        message: "La imagen supera el límite máximo de 10 MB.",
+      });
+    }
+    return res.status(400).json({ success: false, message: err.message });
+  }
+
+  if (err && err.type === "entity.too.large") {
+    return res.status(413).json({
+      success: false,
+      message: "Los datos enviados superan el límite permitido.",
+    });
+  }
+
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).json({
+      success: false,
+      message: "JSON malformado en la petición.",
+    });
+  }
+
+  console.error("🔴 Error no controlado en Express:", err?.message || err);
+  if (!res.headersSent) {
+    return res.status(500).json({
+      success: false,
+      message: err?.message || "Error interno del servidor.",
+    });
+  }
+});
+
+// Evita que una promesa suelta sin catch tumbe silenciosamente Node sin dejar rastro en logs
+process.on("unhandledRejection", (reason) => {
+  console.error("🔴 Unhandled Rejection:", reason);
+});
+
+
+
 const PUERTO_APP = process.env.PORT || 3000;
 app.listen(PUERTO_APP, () => {
   console.log(`🚀 Servidor ejecutándose en el puerto ${PUERTO_APP}`);
