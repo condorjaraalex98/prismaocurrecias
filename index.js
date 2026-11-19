@@ -1817,130 +1817,158 @@ app.get("/personastotal", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+let pnpCacheVersion = 1;
+
+// 1. LISTADO PNP CON CACHÉ (60s en consultas sin búsqueda libre) + LIMIT EN EXPORT
 app.get("/pnptotal", async (req, res) => {
   try {
-    const { q, grado, estado, page = 1, export: isExport } = req.query;
+    const { q = "", grado = "TODOS", estado = "TODOS", page = 1, export: isExport } = req.query;
+    const qLimpio = String(q).trim();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limit = 20;
-    const offset = (Number(page) - 1) * limit;
+    const offset = (pageNum - 1) * limit;
 
-    let params = [];
-    let where = "WHERE 1=1";
+    const buildWhere = () => {
+      const params = [];
+      let where = "WHERE 1=1";
 
-    // 1. Buscador global (Nombres, Apellidos o DNI)
-    if (q && q.trim() !== "") {
-      const terms = q.trim().split(/\s+/);
-      terms.forEach((t) => {
-        where += ` AND (p.nombres LIKE ? OR p.apellidos LIKE ? OR p.dni LIKE ?)`;
-        const patt = `%${t}%`;
-        params.push(patt, patt, patt);
-      });
-    }
+      if (qLimpio !== "") {
+        const terms = qLimpio.split(/\s+/).slice(0, 5);
+        terms.forEach((t) => {
+          where += " AND (p.nombres LIKE ? OR p.apellidos LIKE ? OR p.dni LIKE ?)";
+          const patt = `%${t}%`;
+          params.push(patt, patt, patt);
+        });
+      }
 
-    // 2. Filtros dinámicos
-    if (grado && grado !== "TODOS") {
-      where += ` AND p.grado = ?`;
-      params.push(grado);
-    }
+      if (grado && grado !== "TODOS") {
+        where += " AND p.grado = ?";
+        params.push(grado);
+      }
 
-    if (estado && estado !== "TODOS") {
-      where += ` AND p.estado = ?`;
-      params.push(Number(estado));
-    }
+      if (estado && estado !== "TODOS") {
+        where += " AND p.estado = ?";
+        params.push(Number(estado));
+      }
 
-    // Exportación a Excel completa
+      return { where, params };
+    };
+
     if (isExport === "true") {
+      const { where, params } = buildWhere();
       const sqlExport = `
         SELECT p.* 
         FROM cat_pnp p 
         ${where} 
-        ORDER BY p.id_pnp DESC`;
-
+        ORDER BY p.id_pnp DESC
+        LIMIT 5000`;
       const [exportResults] = await db.query(sqlExport, params);
       return res.json({ data: exportResults });
     }
 
-    // 3. Consulta con paginación (Ordenado por id_pnp DESC)
-    const sqlData = `
-      SELECT p.* 
-      FROM cat_pnp p 
-      ${where} 
-      ORDER BY p.id_pnp DESC 
-      LIMIT ? OFFSET ?`;
+    const fetchPaginado = async () => {
+      const { where, params } = buildWhere();
 
-    // Conteo para cat_pnp (1: Activo, 0: Inactivo)
-    const sqlCounts = `
-      SELECT 
-        COUNT(*) as total,
-        COUNT(CASE WHEN p.estado = 1 THEN 1 END) as activos,
-        COUNT(CASE WHEN p.estado = 0 THEN 1 END) as inactivos
-      FROM cat_pnp p
-      ${where}`;
+      const sqlData = `
+        SELECT p.* 
+        FROM cat_pnp p 
+        ${where} 
+        ORDER BY p.id_pnp DESC 
+        LIMIT ? OFFSET ?`;
 
-    // Ejecución en paralelo
-    const [[results], [countsData]] = await Promise.all([
-      db.query(sqlData, [...params, limit, offset]),
-      db.query(sqlCounts, params),
-    ]);
+      const sqlCounts = `
+        SELECT 
+          COUNT(*) as total,
+          COUNT(CASE WHEN p.estado = 1 THEN 1 END) as activos,
+          COUNT(CASE WHEN p.estado = 0 THEN 1 END) as inactivos
+        FROM cat_pnp p
+        ${where}`;
 
-    const totalRecords = countsData[0]?.total || 0;
+      const [[results], [countsData]] = await Promise.all([
+        db.query(sqlData, [...params, limit, offset]),
+        db.query(sqlCounts, params),
+      ]);
 
-    res.json({
-      data: results,
-      counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
-      pagination: {
-        currentPage: Number(page),
-        limit,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        hasMore: offset + results.length < totalRecords,
-      },
-    });
+      const totalRecords = countsData[0]?.total || 0;
+
+      return {
+        data: results,
+        counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
+        pagination: {
+          currentPage: pageNum,
+          limit,
+          totalRecords,
+          totalPages: Math.ceil(totalRecords / limit),
+          hasMore: offset + results.length < totalRecords,
+        },
+      };
+    };
+
+    if (qLimpio === "") {
+      const cacheKey = `pnp_v${pnpCacheVersion}_${grado}_${estado}_p${pageNum}`;
+      const respuesta = await obtenerConCache(cacheKey, fetchPaginado, 60 * 1000);
+      return res.json(respuesta);
+    }
+
+    const respuesta = await fetchPaginado();
+    return res.json(respuesta);
   } catch (err) {
     console.error("Error en /pnptotal:", err);
     res.status(500).json({ error: err.message });
   }
 });
+
+
 app.put("/updatepnp/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { grado, nombres, apellidos, dni, estado } = req.body;
+    const { grado, nombres, apellidos, dni, estado } = req.body || {};
 
-    // 1. Validación básica de campos requeridos
-    if (!grado || !nombres || !apellidos || !dni) {
+    if (!grado?.trim() || !nombres?.trim() || !apellidos?.trim() || !dni?.trim()) {
       return res.status(400).json({
         success: false,
         message: "Los campos grado, nombres, apellidos y dni son obligatorios",
       });
     }
 
-    // 2. Consulta SQL de actualización
-    const sql = `
-      UPDATE cat_pnp 
-      SET 
-        grado = ?, 
-        nombres = ?, 
-        apellidos = ?, 
-        dni = ?, 
-        estado = ?
-      WHERE id_pnp = ?
-    `;
+    const dniLimpio = String(dni).trim();
+    const [duplicado] = await db.query(
+      "SELECT id_pnp FROM cat_pnp WHERE dni = ? AND id_pnp <> ? LIMIT 1",
+      [dniLimpio, id]
+    );
 
-    const [result] = await db.query(sql, [
-      grado.trim(),
-      nombres.toUpperCase().trim(),
-      apellidos.toUpperCase().trim(),
-      dni.trim(),
-      estado !== undefined ? Number(estado) : 1,
-      id,
-    ]);
+    if (duplicado.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: "DNI_DUPLICADO",
+        message: `El DNI ${dniLimpio} ya pertenece a otro efectivo PNP.`,
+      });
+    }
 
-    // 3. Verificar si el registro existía
+    const [result] = await db.query(
+      `UPDATE cat_pnp 
+       SET grado = ?, nombres = ?, apellidos = ?, dni = ?, estado = ?
+       WHERE id_pnp = ?`,
+      [
+        grado.trim(),
+        nombres.toUpperCase().trim(),
+        apellidos.toUpperCase().trim(),
+        dniLimpio,
+        estado !== undefined && estado !== null ? Number(estado) : 1,
+        id,
+      ]
+    );
+
     if (result.affectedRows === 0) {
       return res.status(404).json({
         success: false,
         message: "No se encontró ningún efectivo PNP con el ID proporcionado",
       });
     }
+
+    pnpCacheVersion++;
+    catalogosCache.delete("cat_pnp_activos");
 
     res.json({
       success: true,
@@ -1958,10 +1986,11 @@ app.put("/updatepnp/:id", async (req, res) => {
 // 1. Endpoint auxiliar para verificar DNI en tiempo real
 app.get("/checkdnipnp/:dni", async (req, res) => {
   try {
-    const { dni } = req.params;
+    const dniLimpio = String(req.params.dni || "").trim();
+    if (!dniLimpio) return res.json({ existe: false });
     const [rows] = await db.query(
-      "SELECT id_pnp FROM cat_pnp WHERE dni = ?",
-      [dni.trim()]
+      "SELECT id_pnp FROM cat_pnp WHERE dni = ? LIMIT 1",
+      [dniLimpio]
     );
     res.json({ existe: rows.length > 0 });
   } catch (err) {
@@ -1972,42 +2001,42 @@ app.get("/checkdnipnp/:dni", async (req, res) => {
 // 2. Endpoint de Inserción con validación de DNI Duplicado
 app.post("/insertpnp", async (req, res) => {
   try {
-    const { grado, nombres, apellidos, dni, estado = 1 } = req.body;
+    const { grado, nombres, apellidos, dni, estado = 1 } = req.body || {};
 
-    if (!grado || !nombres || !apellidos || !dni) {
+    if (!grado?.trim() || !nombres?.trim() || !apellidos?.trim() || !dni?.trim()) {
       return res.status(400).json({
         success: false,
         message: "Los campos grado, nombres, apellidos y dni son obligatorios",
       });
     }
 
-    // Validación de DNI existente
+    const dniLimpio = String(dni).trim();
     const [existente] = await db.query(
-      "SELECT id_pnp FROM cat_pnp WHERE dni = ?",
-      [dni.trim()]
+      "SELECT id_pnp FROM cat_pnp WHERE dni = ? LIMIT 1",
+      [dniLimpio]
     );
 
     if (existente.length > 0) {
       return res.status(409).json({
         success: false,
         code: "DNI_DUPLICADO",
-        message: `El DNI ${dni} ya se encuentra registrado en el sistema.`,
+        message: `El DNI ${dniLimpio} ya se encuentra registrado en el sistema.`,
       });
     }
 
-    const sql = `
-      INSERT INTO cat_pnp 
-      (grado, nombres, apellidos, dni, estado) 
-      VALUES (?, ?, ?, ?, ?)
-    `;
+    const [result] = await db.query(
+      "INSERT INTO cat_pnp (grado, nombres, apellidos, dni, estado) VALUES (?, ?, ?, ?, ?)",
+      [
+        grado.trim(),
+        nombres.toUpperCase().trim(),
+        apellidos.toUpperCase().trim(),
+        dniLimpio,
+        Number(estado),
+      ]
+    );
 
-    const [result] = await db.query(sql, [
-      grado.trim(),
-      nombres.toUpperCase().trim(),
-      apellidos.toUpperCase().trim(),
-      dni.trim(),
-      Number(estado),
-    ]);
+    pnpCacheVersion++;
+    catalogosCache.delete("cat_pnp_activos");
 
     res.status(201).json({
       success: true,
@@ -2027,93 +2056,119 @@ app.post("/insertpnp", async (req, res) => {
 // 1. Obtener Flota Municipal con paginación y búsqueda
 app.get("/flotatotal", async (req, res) => {
   try {
-    const { q, tipo_servicio, estado, id_tipo_vehiculo, page = 1, export: isExport } = req.query;
+    const {
+      q = "",
+      estado = "TODOS",
+      id_tipo_vehiculo = "TODOS",
+      page = 1,
+      export: isExport,
+    } = req.query;
+
+    const qLimpio = String(q).trim();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limit = 20;
-    const offset = (Number(page) - 1) * limit;
+    const offset = (pageNum - 1) * limit;
 
-    let params = [];
-    let where = "WHERE 1=1";
+    const buildWhere = () => {
+      const params = [];
+      let where = "WHERE 1=1";
 
-    if (q && q.trim() !== "") {
-      const terms = q.trim().split(/\s+/);
-      terms.forEach((t) => {
-        where += ` AND (f.placa LIKE ? OR f.numero_unidad LIKE ? OR f.marca LIKE ? OR f.modelo LIKE ?)`;
-        const patt = `%${t}%`;
-        params.push(patt, patt, patt, patt);
-      });
-    }
+      if (qLimpio !== "") {
+        const terms = qLimpio.split(/\s+/).slice(0, 5);
+        terms.forEach((t) => {
+          where +=
+            " AND (f.placa LIKE ? OR f.numero_unidad LIKE ? OR f.marca LIKE ? OR f.modelo LIKE ?)";
+          const patt = `%${t}%`;
+          params.push(patt, patt, patt, patt);
+        });
+      }
 
-    if (estado && estado !== "TODOS") {
-      where += ` AND f.estado = ?`;
-      params.push(Number(estado));
-    }
+      if (estado && estado !== "TODOS") {
+        where += " AND f.estado = ?";
+        params.push(Number(estado));
+      }
 
-    // NUEVO: Filtro por Tipo de Vehículo
-    if (id_tipo_vehiculo && id_tipo_vehiculo !== "TODOS") {
-      where += ` AND f.id_tipo_vehiculo = ?`;
-      params.push(id_tipo_vehiculo);
-    }
+      if (id_tipo_vehiculo && id_tipo_vehiculo !== "TODOS") {
+        where += " AND f.id_tipo_vehiculo = ?";
+        params.push(id_tipo_vehiculo);
+      }
+
+      return { where, params };
+    };
 
     if (isExport === "true") {
+      const { where, params } = buildWhere();
       const sqlExport = `
         SELECT f.*, tv.descripcion as tipo_vehiculo_nombre
         FROM sipcop_flota_municipal f
         LEFT JOIN tipo_vehiculo tv ON f.id_tipo_vehiculo = tv.id_tipo_vehiculo
         ${where}
-        ORDER BY f.id_unidad DESC`;
+        ORDER BY f.id_unidad DESC
+        LIMIT 5000`;
 
       const [exportResults] = await db.query(sqlExport, params);
       return res.json({ data: exportResults });
     }
 
-    const sqlData = `
-      SELECT 
-        f.*, 
-        tv.descripcion as tipo_vehiculo_nombre
-      FROM sipcop_flota_municipal f
-      LEFT JOIN tipo_vehiculo tv ON f.id_tipo_vehiculo = tv.id_tipo_vehiculo
-      ${where}
-      ORDER BY f.id_unidad DESC
-      LIMIT ? OFFSET ?`;
+    const fetchPaginado = async () => {
+      const { where, params } = buildWhere();
 
-    const sqlCounts = `
-      SELECT 
-        COUNT(*) as total,
-        COUNT(CASE WHEN f.estado = 1 THEN 1 END) as activos,
-        COUNT(CASE WHEN f.estado = 0 THEN 1 END) as inactivos
-      FROM sipcop_flota_municipal f
-      ${where}`;
+      const sqlData = `
+        SELECT f.*, tv.descripcion as tipo_vehiculo_nombre
+        FROM sipcop_flota_municipal f
+        LEFT JOIN tipo_vehiculo tv ON f.id_tipo_vehiculo = tv.id_tipo_vehiculo
+        ${where}
+        ORDER BY f.id_unidad DESC
+        LIMIT ? OFFSET ?`;
 
-    const [[results], [countsData]] = await Promise.all([
-      db.query(sqlData, [...params, limit, offset]),
-      db.query(sqlCounts, params),
-    ]);
+      const sqlCounts = `
+        SELECT 
+          COUNT(*) as total,
+          COUNT(CASE WHEN f.estado = 1 THEN 1 END) as activos,
+          COUNT(CASE WHEN f.estado = 0 THEN 1 END) as inactivos
+        FROM sipcop_flota_municipal f
+        ${where}`;
 
-    const totalRecords = countsData[0]?.total || 0;
+      const [[results], [countsData]] = await Promise.all([
+        db.query(sqlData, [...params, limit, offset]),
+        db.query(sqlCounts, params),
+      ]);
 
-    res.json({
-      data: results,
-      counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
-      pagination: {
-        currentPage: Number(page),
-        limit,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        hasMore: offset + results.length < totalRecords,
-      },
-    });
+      const totalRecords = countsData[0]?.total || 0;
+
+      return {
+        data: results,
+        counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
+        pagination: {
+          currentPage: pageNum,
+          limit,
+          totalRecords,
+          totalPages: Math.ceil(totalRecords / limit),
+          hasMore: offset + results.length < totalRecords,
+        },
+      };
+    };
+
+    if (qLimpio === "") {
+      const cacheKey = `flota_v${flotaCacheVersion}_${estado}_${id_tipo_vehiculo}_p${pageNum}`;
+      const respuesta = await obtenerConCache(cacheKey, fetchPaginado, 60 * 1000);
+      return res.json(respuesta);
+    }
+
+    const respuesta = await fetchPaginado();
+    return res.json(respuesta);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 // 2. Verificar Placa Duplicada en tiempo real
 app.get("/checkplacacop/:placa", async (req, res) => {
   try {
-    const { placa } = req.params;
+    const placaLimpia = String(req.params.placa || "").trim().toUpperCase();
+    if (!placaLimpia) return res.json({ existe: false });
     const [rows] = await db.query(
-      "SELECT id_unidad FROM sipcop_flota_municipal WHERE placa = ?",
-      [placa.trim().toUpperCase()]
+      "SELECT id_unidad FROM sipcop_flota_municipal WHERE placa = ? LIMIT 1",
+      [placaLimpia]
     );
     res.json({ existe: rows.length > 0 });
   } catch (err) {
@@ -2124,76 +2179,114 @@ app.get("/checkplacacop/:placa", async (req, res) => {
 app.put("/updateflota/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { placa, id_tipo_vehiculo, numero_unidad, tipo_servicio, marca, modelo, año, estado } = req.body;
+    const {
+      placa,
+      id_tipo_vehiculo,
+      numero_unidad,
+      tipo_servicio,
+      marca,
+      modelo,
+      año,
+      estado,
+    } = req.body || {};
 
-    const sql = `
-      UPDATE sipcop_flota_municipal 
-      SET 
-        placa = ?,
-        id_tipo_vehiculo = ?,
-        numero_unidad = ?,
-        tipo_servicio = ?,
-        marca = ?,
-        modelo = ?,
-        año = ?,
-        estado = ?
-      WHERE id_unidad = ?`;
+    if (!placa?.trim()) {
+      return res.status(400).json({ success: false, message: "La placa es obligatoria" });
+    }
 
-    const [result] = await db.query(sql, [
-      placa ? placa.trim().toUpperCase() : null,
-      id_tipo_vehiculo || null,
-      numero_unidad || null,
-      tipo_servicio || "MUNICIPAL",
-      marca || null,
-      modelo || null,
-      año || null,
-      Number(estado),
-      id,
-    ]);
+    const placaLimpia = String(placa).trim().toUpperCase();
+    const [duplicado] = await db.query(
+      "SELECT id_unidad FROM sipcop_flota_municipal WHERE placa = ? AND id_unidad <> ? LIMIT 1",
+      [placaLimpia, id]
+    );
 
+    if (duplicado.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: "PLACA_DUPLICADA",
+        message: `La placa ${placaLimpia} ya pertenece a otra unidad.`,
+      });
+    }
+
+    const [result] = await db.query(
+      `UPDATE sipcop_flota_municipal 
+       SET placa = ?, id_tipo_vehiculo = ?, numero_unidad = ?, tipo_servicio = ?, marca = ?, modelo = ?, año = ?, estado = ?
+       WHERE id_unidad = ?`,
+      [
+        placaLimpia,
+        id_tipo_vehiculo ? Number(id_tipo_vehiculo) : null,
+        numero_unidad ? String(numero_unidad).trim() : null,
+        tipo_servicio || "MUNICIPAL",
+        marca ? String(marca).trim().toUpperCase() : null,
+        modelo ? String(modelo).trim().toUpperCase() : null,
+        año || null,
+        estado !== undefined && estado !== null ? Number(estado) : 1,
+        id,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Unidad no encontrada" });
+    }
+
+    invalidarCacheFlota();
     res.json({ success: true, message: "Unidad actualizada correctamente" });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 // 3. Insertar nueva unidad de flota con validación de Placa Duplicada
 app.post("/insertflota", async (req, res) => {
   try {
-    const { placa, id_tipo_vehiculo, numero_unidad, tipo_servicio, marca, modelo, año, estado = 1 } = req.body;
+    const {
+      placa,
+      id_tipo_vehiculo,
+      numero_unidad,
+      tipo_servicio,
+      marca,
+      modelo,
+      año,
+      estado = 1,
+    } = req.body || {};
 
-    if (!placa) {
-      return res.status(400).json({ success: false, message: "La placa es obligatoria" });
+    if (!placa?.trim() || !id_tipo_vehiculo || !numero_unidad?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Placa, tipo de vehículo y número de unidad son obligatorios",
+      });
     }
 
-    // Validar si la placa existe
+    const placaLimpia = String(placa).trim().toUpperCase();
     const [existente] = await db.query(
-      "SELECT id_unidad FROM sipcop_flota_municipal WHERE placa = ?",
-      [placa.trim().toUpperCase()]
+      "SELECT id_unidad FROM sipcop_flota_municipal WHERE placa = ? LIMIT 1",
+      [placaLimpia]
     );
 
     if (existente.length > 0) {
       return res.status(409).json({
         success: false,
         code: "PLACA_DUPLICADA",
-        message: `La placa ${placa} ya está registrada en el sistema.`,
+        message: `La placa ${placaLimpia} ya está registrada en el sistema.`,
       });
     }
 
-    const sql = `
-      INSERT INTO sipcop_flota_municipal 
-      (placa, id_tipo_vehiculo, numero_unidad, tipo_servicio, marca, modelo, año, estado) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+    const [result] = await db.query(
+      `INSERT INTO sipcop_flota_municipal 
+       (placa, id_tipo_vehiculo, numero_unidad, tipo_servicio, marca, modelo, año, estado) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        placaLimpia,
+        Number(id_tipo_vehiculo),
+        String(numero_unidad).trim(),
+        tipo_servicio || "MUNICIPAL",
+        marca ? String(marca).trim().toUpperCase() : null,
+        modelo ? String(modelo).trim().toUpperCase() : null,
+        año || null,
+        Number(estado),
+      ]
+    );
 
-    const [result] = await db.query(sql, [
-      placa.trim().toUpperCase(),
-      id_tipo_vehiculo || null,
-      numero_unidad || null,
-      tipo_servicio || "MUNICIPAL",
-      marca || null,
-      modelo || null,
-      año || null,
-      Number(estado),
-    ]);
+    invalidarCacheFlota();
 
     res.status(201).json({
       success: true,
@@ -2205,19 +2298,28 @@ app.post("/insertflota", async (req, res) => {
   }
 });
 // Endpoint para obtener el listado de tipos de vehículo para los select/pickers
+let flotaCacheVersion = 1;
+
+function invalidarCacheFlota() {
+  flotaCacheVersion++;
+  for (const key of catalogosCache.keys()) {
+    if (key.startsWith("cat_vehiculos_tipo_")) {
+      catalogosCache.delete(key);
+    }
+  }
+}
+
+// 1. TIPOS DE VEHÍCULO CON CACHÉ (15 min)
 app.get("/tiposvehiculo", async (req, res) => {
   try {
-    const sql = `
-      SELECT 
-        id_tipo_vehiculo, 
-        descripcion, 
-        modalidad 
-      FROM tipo_vehiculo 
-      ORDER BY descripcion ASC`;
-
-    const [rows] = await db.query(sql);
-    
-    // Retorna el array directamente o dentro del objeto
+    const rows = await obtenerConCache("cat_tiposvehiculo_flota", async () => {
+      const sql = `
+        SELECT id_tipo_vehiculo, descripcion, modalidad 
+        FROM tipo_vehiculo 
+        ORDER BY descripcion ASC`;
+      const [r] = await db.query(sql);
+      return r;
+    });
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error("Error al obtener tipos de vehículo:", err);
@@ -2225,32 +2327,41 @@ app.get("/tiposvehiculo", async (req, res) => {
   }
 });
 
-
 // ==========================================
 /// ==========================================
 // 1. OBTENER CATÁLOGOS PARA EL FRONTEND
 // ==========================================
+let lugaresCacheVersion = 1;
+
+function invalidarCacheLugares() {
+  lugaresCacheVersion++;
+  for (const key of catalogosCache.keys()) {
+    if (
+      key.startsWith("cat_lugares_") ||
+      key.startsWith("cat_cuadras_") ||
+      key.startsWith("cat_unif_") ||
+      key.startsWith("lugarcecom_") ||
+      key === "cat_lugar_catalogos" ||
+      key === "mapa_completo_gis"
+    ) {
+      catalogosCache.delete(key);
+    }
+  }
+}
+
+// 1. CATÁLOGOS DE LUGARES CON CACHÉ (15 min)
 app.get("/lugar-catalogos", async (req, res) => {
   try {
-    const [tiposLugar] = await db.query(
-      "SELECT id_tipo, nombre_tipo FROM tipos_lugar"
-    );
-    const [tiposVia] = await db.query(
-      "SELECT id_tipo_via, abreviatura FROM tipo_via WHERE estado = 1"
-    );
-    const [vias] = await db.query(
-      "SELECT id_via, id_tipo_via, nombre_via FROM via WHERE estado = 1"
-    );
-    const [cuadras] = await db.query(
-      "SELECT id_cuadra, numero_cuadra FROM cuadra ORDER BY numero_cuadra ASC"
-    );
-
-    res.json({
-      tiposLugar,
-      tiposVia,
-      vias,
-      cuadras,
+    const data = await obtenerConCache("cat_lugar_catalogos", async () => {
+      const [[tiposLugar], [tiposVia], [vias], [cuadras]] = await Promise.all([
+        db.query("SELECT id_tipo, nombre_tipo FROM tipos_lugar ORDER BY nombre_tipo ASC"),
+        db.query("SELECT id_tipo_via, abreviatura FROM tipo_via WHERE estado = 1 ORDER BY abreviatura ASC"),
+        db.query("SELECT id_via, id_tipo_via, nombre_via FROM via WHERE estado = 1 ORDER BY nombre_via ASC"),
+        db.query("SELECT id_cuadra, numero_cuadra FROM cuadra ORDER BY numero_cuadra ASC"),
+      ]);
+      return { tiposLugar, tiposVia, vias, cuadras };
     });
+    res.json(data);
   } catch (err) {
     console.error("❌ Error en /lugar-catalogos:", err);
     res.status(500).json({ error: err.message });
@@ -2262,120 +2373,127 @@ app.get("/lugar-catalogos", async (req, res) => {
 // ==========================================
 app.get("/lugarestotal", async (req, res) => {
   try {
-    const { q, tipo, via, cuadra, estado, page = 1, export: isExport } = req.query;
+    const {
+      q = "",
+      tipo = "TODOS",
+      via = "TODOS",
+      cuadra = "TODOS",
+      estado = "TODOS",
+      page = 1,
+      export: isExport,
+    } = req.query;
+
+    const qLimpio = String(q).trim();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limit = 20;
-    const offset = (Number(page) - 1) * limit;
+    const offset = (pageNum - 1) * limit;
 
-    let params = [];
-    let where = "WHERE 1=1";
+    const buildWhere = () => {
+      const params = [];
+      let where = "WHERE 1=1";
 
-    if (q && q.trim() !== "") {
-      const terms = q.trim().split(/\s+/);
-      terms.forEach((t) => {
-        where += ` AND (l.nombre_lugar LIKE ? OR l.unidad_encargada LIKE ? OR v.nombre_via LIKE ? OR c.numero_cuadra LIKE ?)`;
-        const patt = `%${t}%`;
-        params.push(patt, patt, patt, patt);
-      });
-    }
+      if (qLimpio !== "") {
+        const terms = qLimpio.split(/\s+/).slice(0, 5);
+        terms.forEach((t) => {
+          where +=
+            " AND (l.nombre_lugar LIKE ? OR l.unidad_encargada LIKE ? OR v.nombre_via LIKE ? OR c.numero_cuadra LIKE ?)";
+          const patt = `%${t}%`;
+          params.push(patt, patt, patt, patt);
+        });
+      }
+      if (tipo && tipo !== "TODOS") {
+        where += " AND l.id_tipo_lugar = ?";
+        params.push(tipo);
+      }
+      if (via && via !== "TODOS") {
+        where += " AND l.id_via = ?";
+        params.push(via);
+      }
+      if (cuadra && cuadra !== "TODOS") {
+        where += " AND l.id_cuadra = ?";
+        params.push(cuadra);
+      }
+      if (estado && estado !== "TODOS") {
+        where += " AND l.estado = ?";
+        params.push(Number(estado));
+      }
 
-    if (tipo && tipo !== "TODOS") {
-      where += ` AND l.id_tipo_lugar = ?`;
-      params.push(tipo);
-    }
-
-    if (via && via !== "TODOS") {
-      where += ` AND l.id_via = ?`;
-      params.push(via);
-    }
-
-    if (cuadra && cuadra !== "TODOS") {
-      where += ` AND l.id_cuadra = ?`;
-      params.push(cuadra);
-    }
-
-    if (estado && estado !== "TODOS") {
-      where += ` AND l.estado = ?`;
-      params.push(Number(estado));
-    }
+      return { where, params };
+    };
 
     if (isExport === "true") {
+      const { where, params } = buildWhere();
       const sqlExport = `
         SELECT 
-          l.id_lugar,
-          l.nombre_lugar,
-          l.id_tipo_lugar,
-          tl.nombre_tipo AS tipo_descripcion,
-          l.id_via,
-          v.id_tipo_via,
-          v.nombre_via,
-          l.id_cuadra,
-          c.numero_cuadra,
-          l.unidad_encargada,
-          l.latitud,
-          l.longitud,
-          l.estado
+          l.id_lugar, l.nombre_lugar, l.id_tipo_lugar, tl.nombre_tipo AS tipo_descripcion,
+          l.id_via, v.id_tipo_via, v.nombre_via, l.id_cuadra, c.numero_cuadra,
+          l.unidad_encargada, l.latitud, l.longitud, l.estado
         FROM lugar l
         LEFT JOIN tipos_lugar tl ON l.id_tipo_lugar = tl.id_tipo
         LEFT JOIN via v ON l.id_via = v.id_via
         LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
         ${where} 
-        ORDER BY l.id_lugar DESC`;
+        ORDER BY l.id_lugar DESC
+        LIMIT 5000`;
 
       const [exportResults] = await db.query(sqlExport, params);
       return res.json({ data: exportResults });
     }
 
-    const sqlData = `
-      SELECT 
-        l.id_lugar,
-        l.nombre_lugar,
-        l.id_tipo_lugar,
-        tl.nombre_tipo AS tipo_descripcion,
-        l.id_via,
-        v.id_tipo_via,
-        v.nombre_via,
-        l.id_cuadra,
-        c.numero_cuadra,
-        l.unidad_encargada,
-        l.latitud,
-        l.longitud,
-        l.estado
-      FROM lugar l
-      LEFT JOIN tipos_lugar tl ON l.id_tipo_lugar = tl.id_tipo
-      LEFT JOIN via v ON l.id_via = v.id_via
-      LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
-      ${where} 
-      ORDER BY l.id_lugar DESC 
-      LIMIT ? OFFSET ?`;
+    const fetchPaginado = async () => {
+      const { where, params } = buildWhere();
 
-    const sqlCounts = `
-      SELECT 
-        COUNT(*) as total,
-        COUNT(CASE WHEN l.estado = 1 THEN 1 END) as activos,
-        COUNT(CASE WHEN l.estado = 0 THEN 1 END) as inactivos
-      FROM lugar l
-      LEFT JOIN via v ON l.id_via = v.id_via
-      LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
-      ${where}`;
+      const sqlData = `
+        SELECT 
+          l.id_lugar, l.nombre_lugar, l.id_tipo_lugar, tl.nombre_tipo AS tipo_descripcion,
+          l.id_via, v.id_tipo_via, v.nombre_via, l.id_cuadra, c.numero_cuadra,
+          l.unidad_encargada, l.latitud, l.longitud, l.estado
+        FROM lugar l
+        LEFT JOIN tipos_lugar tl ON l.id_tipo_lugar = tl.id_tipo
+        LEFT JOIN via v ON l.id_via = v.id_via
+        LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
+        ${where} 
+        ORDER BY l.id_lugar DESC 
+        LIMIT ? OFFSET ?`;
 
-    const [[results], [countsData]] = await Promise.all([
-      db.query(sqlData, [...params, limit, offset]),
-      db.query(sqlCounts, params),
-    ]);
+      const sqlCounts = `
+        SELECT 
+          COUNT(*) as total,
+          COUNT(CASE WHEN l.estado = 1 THEN 1 END) as activos,
+          COUNT(CASE WHEN l.estado = 0 THEN 1 END) as inactivos
+        FROM lugar l
+        LEFT JOIN via v ON l.id_via = v.id_via
+        LEFT JOIN cuadra c ON l.id_cuadra = c.id_cuadra
+        ${where}`;
 
-    const totalRecords = countsData[0]?.total || 0;
+      const [[results], [countsData]] = await Promise.all([
+        db.query(sqlData, [...params, limit, offset]),
+        db.query(sqlCounts, params),
+      ]);
 
-    res.json({
-      data: results,
-      counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
-      pagination: {
-        currentPage: Number(page),
-        limit,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        hasMore: offset + results.length < totalRecords,
-      },
-    });
+      const totalRecords = countsData[0]?.total || 0;
+
+      return {
+        data: results,
+        counts: countsData[0] || { total: 0, activos: 0, inactivos: 0 },
+        pagination: {
+          currentPage: pageNum,
+          limit,
+          totalRecords,
+          totalPages: Math.ceil(totalRecords / limit),
+          hasMore: offset + results.length < totalRecords,
+        },
+      };
+    };
+
+    if (qLimpio === "") {
+      const cacheKey = `lugares_v${lugaresCacheVersion}_${tipo}_${via}_${cuadra}_${estado}_p${pageNum}`;
+      const respuesta = await obtenerConCache(cacheKey, fetchPaginado, 60 * 1000);
+      return res.json(respuesta);
+    }
+
+    const respuesta = await fetchPaginado();
+    return res.json(respuesta);
   } catch (err) {
     console.error("❌ Error en /lugarestotal:", err);
     res.status(500).json({ error: err.message });
@@ -2385,6 +2503,7 @@ app.get("/lugarestotal", async (req, res) => {
 // ==========================================
 // 3. ACTUALIZAR REGISTRO EN LUGAR
 // ==========================================
+invalidarCacheLugares();
 app.put("/updatelugar/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -2491,6 +2610,8 @@ app.get("/checklugar/:id_via/:id_cuadra", async (req, res) => {
 // ==========================================
 // 5. INSERTAR REGISTRO EN LUGAR
 // ==========================================
+
+invalidarCacheLugares();
 app.post("/insertlugar", async (req, res) => {
   try {
     const { nombre_lugar, id_tipo_lugar, id_via, id_cuadra, latitud, longitud, estado = 1, unidad_encargada } = req.body;
@@ -2562,18 +2683,28 @@ app.post("/insertlugar", async (req, res) => {
 });
 // ==========================================
 // 5. INSERTAR VIA
+let viasCacheVersion = 1;
 
-// Catálogos para los Pickers (Distritos y Tipos de Vía)
+function invalidarCacheVias() {
+  viasCacheVersion++;
+  for (const key of catalogosCache.keys()) {
+    if (key.startsWith("cat_vias_") || key === "cat_lugar_vias") {
+      catalogosCache.delete(key);
+    }
+  }
+}
+
+// 1. CATÁLOGOS LUGAR-VÍAS CON CACHÉ (15 min)
 app.get("/lugar-vias", async (req, res) => {
   try {
-    const [tiposVia] = await db.query("SELECT id_tipo_via, abreviatura, descripcion FROM tipo_via");
-    const [distritos] = await db.query("SELECT id_distrito, nombre_distrito FROM distrito WHERE estado = 1");
-
-    res.json({
-      success: true,
-      tiposVia,
-      distritos,
+    const data = await obtenerConCache("cat_lugar_vias", async () => {
+      const [[tiposVia], [distritos]] = await Promise.all([
+        db.query("SELECT id_tipo_via, abreviatura, descripcion FROM tipo_via ORDER BY abreviatura ASC"),
+        db.query("SELECT id_distrito, nombre_distrito FROM distrito WHERE estado = 1 ORDER BY nombre_distrito ASC"),
+      ]);
+      return { success: true, tiposVia, distritos };
     });
+    res.json(data);
   } catch (err) {
     console.error("❌ Error al obtener catálogos:", err);
     res.status(500).json({ success: false, error: err.message });
@@ -2583,75 +2714,106 @@ app.get("/lugar-vias", async (req, res) => {
 // Listado total con Paginación, Filtros y JOINs correctos
 app.get("/viastotal", async (req, res) => {
   try {
-    const { q = "", tipo_via = "TODOS", estado = "TODOS", page = 1, export: isExport } = req.query;
+    const {
+      q = "",
+      tipo_via = "TODOS",
+      estado = "TODOS",
+      page = 1,
+      export: isExport,
+    } = req.query;
+
+    const qLimpio = String(q).trim();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limit = 20;
-    const offset = (parseInt(page) - 1) * limit;
+    const offset = (pageNum - 1) * limit;
 
-    let whereClauses = [];
-    let queryParams = [];
+    const buildWhere = () => {
+      const whereClauses = [];
+      const queryParams = [];
 
-    if (q.trim() !== "") {
-      whereClauses.push("v.nombre_via LIKE ?");
-      queryParams.push(`%${q.trim()}%`);
-    }
-
-    if (tipo_via !== "TODOS") {
-      whereClauses.push("v.id_tipo_via = ?");
-      queryParams.push(Number(tipo_via));
-    }
-
-    if (estado !== "TODOS") {
-      whereClauses.push("v.estado = ?");
-      queryParams.push(Number(estado));
-    }
-
-    const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
-
-    const [countsResult] = await db.query(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN estado = 1 THEN 1 ELSE 0 END) as activos,
-        SUM(CASE WHEN estado = 0 THEN 1 ELSE 0 END) as inactivos
-      FROM via
-    `);
-
-    const dataQuery = `
-      SELECT 
-        v.*, 
-        tv.abreviatura, 
-        tv.descripcion AS nombre_tipo_via, 
-        d.nombre_distrito 
-      FROM via v
-      LEFT JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
-      LEFT JOIN distrito d ON v.id_distrito = d.id_distrito
-      ${whereString}
-      ORDER BY v.id_via DESC
-      ${isExport === "true" ? "" : "LIMIT ? OFFSET ?"}
-    `;
-
-    const finalParams = isExport === "true" ? queryParams : [...queryParams, limit, offset];
-    const [rows] = await db.query(dataQuery, finalParams);
-
-    res.json({
-      success: true,
-      counts: countsResult[0] || { total: 0, activos: 0, inactivos: 0 },
-      data: rows,
-      pagination: {
-        hasMore: rows.length === limit,
-        page: parseInt(page),
+      if (qLimpio !== "") {
+        whereClauses.push("v.nombre_via LIKE ?");
+        queryParams.push(`%${qLimpio}%`);
       }
-    });
+      if (tipo_via !== "TODOS") {
+        whereClauses.push("v.id_tipo_via = ?");
+        queryParams.push(Number(tipo_via));
+      }
+      if (estado !== "TODOS") {
+        whereClauses.push("v.estado = ?");
+        queryParams.push(Number(estado));
+      }
 
+      return {
+        whereString: whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "",
+        queryParams,
+      };
+    };
+
+    if (isExport === "true") {
+      const { whereString, queryParams } = buildWhere();
+      const [rows] = await db.query(
+        `SELECT v.*, tv.abreviatura, tv.descripcion AS nombre_tipo_via, d.nombre_distrito
+         FROM via v
+         LEFT JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
+         LEFT JOIN distrito d ON v.id_distrito = d.id_distrito
+         ${whereString}
+         ORDER BY v.id_via DESC
+         LIMIT 5000`,
+        queryParams
+      );
+      return res.json({ success: true, data: rows });
+    }
+
+    const fetchPaginado = async () => {
+      const { whereString, queryParams } = buildWhere();
+
+      const [[countsResult], [rows]] = await Promise.all([
+        db.query(`
+          SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN estado = 1 THEN 1 ELSE 0 END) as activos,
+            SUM(CASE WHEN estado = 0 THEN 1 ELSE 0 END) as inactivos
+          FROM via
+        `),
+        db.query(
+          `SELECT v.*, tv.abreviatura, tv.descripcion AS nombre_tipo_via, d.nombre_distrito
+           FROM via v
+           LEFT JOIN tipo_via tv ON v.id_tipo_via = tv.id_tipo_via
+           LEFT JOIN distrito d ON v.id_distrito = d.id_distrito
+           ${whereString}
+           ORDER BY v.id_via DESC
+           LIMIT ? OFFSET ?`,
+          [...queryParams, limit, offset]
+        ),
+      ]);
+
+      return {
+        success: true,
+        counts: countsResult[0] || { total: 0, activos: 0, inactivos: 0 },
+        data: rows,
+        pagination: {
+          hasMore: rows.length === limit,
+          page: pageNum,
+        },
+      };
+    };
+
+    if (qLimpio === "") {
+      const cacheKey = `vias_v${viasCacheVersion}_${tipo_via}_${estado}_p${pageNum}`;
+      const respuesta = await obtenerConCache(cacheKey, fetchPaginado, 60 * 1000);
+      return res.json(respuesta);
+    }
+
+    const respuesta = await fetchPaginado();
+    return res.json(respuesta);
   } catch (err) {
     console.error("❌ Error al listar /viastotal:", err);
-    res.status(500).json({
-      success: false,
-      message: "Error interno del servidor",
-      error: err.message,
-    });
+    res.status(500).json({ success: false, message: "Error interno del servidor", error: err.message });
   }
 });
 
+invalidarCacheVias();
 // Insertar Vía
 app.post("/insertvia", async (req, res) => {
   try {
@@ -2707,7 +2869,7 @@ app.post("/insertvia", async (req, res) => {
     });
   }
 });
-
+invalidarCacheVias();
 // Actualizar Vía
 app.put("/updatevia/:id", async (req, res) => {
   try {
