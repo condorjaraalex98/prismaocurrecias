@@ -9827,7 +9827,7 @@ app.post("/api/vehiculo/iniciar-servicio", async (req, res) => {
       null;
 
     // Validamos que el sector esté entre los valores permitidos, si no, se va como NULL
-    const sectoresPermitidos = ["1", "2", "3", "RF"];
+    const sectoresPermitidos = ["1", "2", "3", "RF","GENERAL"];
     const sectorFinal = sectoresPermitidos.includes(String(sector_asignado)) 
       ? String(sector_asignado) 
       : null;
@@ -11876,6 +11876,116 @@ app.get("/mapa-completoseg", async (req, res) => {
   }
 });
 
+// GET /ocurrencias/matriz-unidades-dia?fecha=YYYY-MM-DD
+app.get("/ocurrencias/matriz-unidades-dia", async (req, res) => {
+  try {
+    const fechaParam =
+      typeof req.query.fecha === "string" ? req.query.fecha.trim() : "";
+    const fecha = /^\d{4}-\d{2}-\d{2}$/.test(fechaParam)
+      ? fechaParam
+      : obtenerFechaHoraPeru().fecha;
+
+    const matrizCacheKey = `matriz139_v${ocurrenciasCacheVersion}_${fecha}`;
+
+    const [matrizRows, flotaTipoRows] = await Promise.all([
+      obtenerConCache(
+        matrizCacheKey,
+        async () => {
+          // Rango indexable (funciona tanto si fecha_evento es DATE como DATETIME)
+          const sqlMatrizUnidades = `
+            SELECT
+              o.id_ocurrencia,
+              o.fecha_evento AS fecha_registro,
+              o.turno AS turno,
+              COALESCE(NULLIF(TRIM(o.sector_asignado), ''), 'SIN SECTOR') AS sector_asignado,
+              COALESCE(o.id_origen, 0) AS id_origen,
+              COALESCE(ori.descripcion, 'SIN ORIGEN') AS origen_descripcion,
+              COALESCE(tvh.id_tipo_vehiculo, 0) AS id_tipo_vehiculo,
+              COALESCE(tvh.descripcion, 'SIN TIPO VEHÍCULO') AS tipo_vehiculo,
+              COALESCE(tp.id_tipop, 0) AS id_tipop,
+              COALESCE(tp.nombre, 'SIN PATRULLAJE') AS tipo_patrullaje,
+              TRIM(
+                CONCAT(
+                  COALESCE(p.apellido_paterno, ''), ' ',
+                  COALESCE(p.apellido_materno, ''),
+                  CASE
+                    WHEN p.nombres IS NOT NULL AND TRIM(p.nombres) != ''
+                    THEN CONCAT(', ', TRIM(p.nombres))
+                    ELSE ''
+                  END
+                )
+              ) AS persona_registro,
+              NULLIF(TRIM(l.nombre_lugar), '') AS direccion,
+              NULLIF(TRIM(CAST(spf.numero_unidad AS CHAR)), '') AS numero_unidad,
+              NULLIF(TRIM(spf.placa), '') AS placa
+            FROM ocurrencia_registro o
+            LEFT JOIN origen ori ON o.id_origen = ori.id_origen
+            LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+            LEFT JOIN persona p ON us.id_persona = p.id_persona
+            LEFT JOIN lugar l ON o.id_lugar = l.id_lugar
+            LEFT JOIN ocurrencia_vehiculo_detalle ovd ON ovd.id_ocurrencia = o.id_ocurrencia
+            LEFT JOIN sipcop_flota_municipal spf ON spf.id_unidad = ovd.id_unidad
+            LEFT JOIN tipo_vehiculo tvh ON COALESCE(ovd.id_tipo_vehiculo, spf.id_tipo_vehiculo) = tvh.id_tipo_vehiculo
+            LEFT JOIN tipo_patrullaje tp ON o.id_tipop = tp.id_tipop
+            WHERE o.fecha_evento >= ?
+              AND o.fecha_evento < DATE_ADD(?, INTERVAL 1 DAY)
+              AND o.id_modalidad = 139
+              AND o.turno IN ('M', 'T', 'N')
+            GROUP BY
+              o.id_ocurrencia, o.fecha_evento, o.turno, o.sector_asignado,
+              o.id_origen, ori.descripcion, tvh.id_tipo_vehiculo, tvh.descripcion,
+              tp.id_tipop, tp.nombre, p.apellido_paterno, p.apellido_materno,
+              p.nombres, l.nombre_lugar, spf.numero_unidad, spf.placa
+            ORDER BY o.id_ocurrencia ASC
+          `;
+          const [rows] = await db.query(sqlMatrizUnidades, [fecha, fecha]);
+          return Array.isArray(rows) ? rows : [];
+        },
+        20 * 1000 // Caché 20s (invalidado al instante por ocurrenciasCacheVersion++)
+      ),
+      obtenerConCache(
+        "cat_flota_por_tipo_matriz",
+        async () => {
+          const sqlFlotaPorTipo = `
+            SELECT
+              COALESCE(tvh.id_tipo_vehiculo, 0) AS id_tipo_vehiculo,
+              COALESCE(tvh.descripcion, 'SIN TIPO VEHÍCULO') AS tipo_vehiculo,
+              COUNT(spf.id_unidad) AS total_flota,
+              GROUP_CONCAT(
+                DISTINCT NULLIF(TRIM(CAST(spf.numero_unidad AS CHAR)), '')
+                ORDER BY CAST(spf.numero_unidad AS UNSIGNED), spf.numero_unidad
+                SEPARATOR ', '
+              ) AS unidades_flota
+            FROM sipcop_flota_municipal spf
+            LEFT JOIN tipo_vehiculo tvh ON spf.id_tipo_vehiculo = tvh.id_tipo_vehiculo
+            WHERE spf.estado = 1
+            GROUP BY tvh.id_tipo_vehiculo, tvh.descripcion
+            ORDER BY tvh.descripcion ASC
+          `;
+          const [rows] = await db.query(sqlFlotaPorTipo);
+          return Array.isArray(rows) ? rows : [];
+        },
+        15 * 60 * 1000
+      ),
+    ]);
+
+    return res.json({
+      success: true,
+      fecha,
+      id_modalidad: 139,
+      matriz_unidades: matrizRows,
+      flota_por_tipo: flotaTipoRows,
+    });
+  } catch (error) {
+    console.error("ERROR EN GET /ocurrencias/matriz-unidades-dia:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Error interno del servidor",
+      matriz_unidades: [],
+      flota_por_tipo: [],
+    });
+  }
+});
 
 // Caché en la memoria RAM del servidor para el mapa completo
 let cacheMapaCompleto = {
