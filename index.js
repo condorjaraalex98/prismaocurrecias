@@ -32,7 +32,7 @@ const db = mysql.createPool({
   port: Number(process.env.DB_PORT) || 8889,
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "root",
-  database: process.env.DB_NAME || "restaurado1",
+  database: process.env.DB_NAME || "restaurado3",
   connectionLimit: Number(process.env.DB_POOL_LIMIT) || 15,
   waitForConnections: true,
   queueLimit: 150, // Evita acumulación infinita de peticiones en RAM si MySQL se satura
@@ -11395,11 +11395,20 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
 
     const mesNum = Math.min(Math.max(1, parseInt(req.query.mes, 10) || Number(mesActualStr)), 12);
     const anioNum = Math.min(Math.max(2020, parseInt(req.query.anio, 10) || Number(anioActualStr)), 2100);
-
+const grupoParam = String(req.query.grupo || "").trim();
+const grupoFiltro = ["1", "2", "3", "4"].includes(grupoParam) ? grupoParam : null;
     const idModalidad = req.query.id_modalidad ? parseInt(req.query.id_modalidad, 10) : null;
     const idOrigen = req.query.id_origen ? parseInt(req.query.id_origen, 10) : null;
     const modo = req.query.modo === "normal" ? "normal" : "turnos";
     const busqueda = String(req.query.busqueda || "").trim();
+
+    // Lista blanca de orígenes permitidos (ej: ?origenes=1,5,6,7,11)
+    const origenesPermitidos = req.query.origenes
+      ? String(req.query.origenes)
+          .split(",")
+          .map((n) => parseInt(n.trim(), 10))
+          .filter((n) => !Number.isNaN(n) && n > 0)
+      : [];
 
     const limitNum = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 200), 500);
     const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -11407,20 +11416,26 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
 
     const campoFecha = modo === "normal" ? "o.fecha_evento" : "o.fechar";
 
-    // Rango indexable (>= inicio de mes y < inicio del mes siguiente)
     const fechaInicio = `${anioNum}-${String(mesNum).padStart(2, "0")}-01`;
     const nextMes = mesNum === 12 ? 1 : mesNum + 1;
     const nextAnio = mesNum === 12 ? anioNum + 1 : anioNum;
     const fechaFin = `${nextAnio}-${String(nextMes).padStart(2, "0")}-01`;
 
-    const cacheKey = `est_m3_${modo}_${anioNum}_${mesNum}_${idModalidad || "all"}_${idOrigen || "all"}_${limitNum}_${pageNum}_${busqueda.toLowerCase()}`;
-
+    const origKey = origenesPermitidos.length > 0 ? origenesPermitidos.join("-") : "all";
+   const cacheKey = `est_m3_${modo}_${anioNum}_${mesNum}_${idModalidad || "all"}_${idOrigen || "all"}_g_${grupoFiltro || "all"}_orig_${origKey}_${limitNum}_${pageNum}_${busqueda.toLowerCase()}`;
     const [modalidadesRows, origenesRows, datosEstadisticos] = await Promise.all([
       obtenerConCache("cat_modalidades_est", async () => {
         const [r] = await db.query("SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC");
         return r;
       }),
-      obtenerConCache("cat_origenes_est", async () => {
+      obtenerConCache(`cat_origenes_est_${origKey}`, async () => {
+        if (origenesPermitidos.length > 0) {
+          const [r] = await db.query(
+            "SELECT id_origen, descripcion FROM origen WHERE id_origen IN (?) ORDER BY descripcion ASC",
+            [origenesPermitidos]
+          );
+          return r;
+        }
         const [r] = await db.query("SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC");
         return r;
       }),
@@ -11430,11 +11445,20 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
           let whereClause = `WHERE ${campoFecha} >= ? AND ${campoFecha} < ?`;
           const queryParams = [fechaInicio, fechaFin];
 
+          // Aplica siempre la restricción a los orígenes permitidos (1, 5, 6, 7, 11)
+          if (origenesPermitidos.length > 0) {
+            whereClause += ` AND o.id_origen IN (${origenesPermitidos.map(() => "?").join(",")})`;
+            queryParams.push(...origenesPermitidos);
+          }
+
           if (idModalidad && !Number.isNaN(idModalidad)) {
             whereClause += ` AND o.id_modalidad = ?`;
             queryParams.push(idModalidad);
           }
-
+if (grupoFiltro) {
+  whereClause += " AND o.grupo = ?";
+  queryParams.push(grupoFiltro);
+}
           if (idOrigen && !Number.isNaN(idOrigen)) {
             whereClause += ` AND o.id_origen = ?`;
             queryParams.push(idOrigen);
@@ -11537,7 +11561,7 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
             },
           };
         },
-        60 * 1000 // Caché 60s para el dashboard
+        60 * 1000
       ),
     ]);
 
@@ -11555,164 +11579,186 @@ app.get("/ocurrencias/estadisticas-mensuales3", async (req, res) => {
   }
 });
 
-
 app.get("/ocurrencias/estadisticas-mensualespara", async (req, res) => {
-  let connection;
   try {
-    connection = await db.getConnection();
+    const { fechaHora } = obtenerFechaHoraPeru();
+    const [anioActualStr, mesActualStr] = fechaHora.split(" ")[0].split("-");
 
-    const mes = req.query.mes || new Date().getMonth() + 1;
-    const anio = req.query.anio || new Date().getFullYear();
-    const idModalidad = req.query.id_modalidad;
-    const idOrigen = req.query.id_origen;
-    const modo = req.query.modo || "turnos";
-    const busqueda = req.query.busqueda || "";
-    
-    const limit = parseInt(req.query.limit) || 10;
-    const page = parseInt(req.query.page) || 1;
-    const offset = (page - 1) * limit;
+    const mesNum = Math.min(Math.max(1, parseInt(req.query.mes, 10) || Number(mesActualStr)), 12);
+    const anioNum = Math.min(Math.max(2020, parseInt(req.query.anio, 10) || Number(anioActualStr)), 2100);
+
+    const idModalidad = req.query.id_modalidad ? parseInt(req.query.id_modalidad, 10) : null;
+    const idOrigen = req.query.id_origen ? parseInt(req.query.id_origen, 10) : null;
+    const modo = req.query.modo === "normal" ? "normal" : "turnos";
+    const busqueda = String(req.query.busqueda || "").trim();
+
+    const limitNum = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 10), 500);
+    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const offsetNum = (pageNum - 1) * limitNum;
 
     const campoFecha = modo === "normal" ? "o.fecha_evento" : "o.fechar";
 
-    let whereClause = `WHERE MONTH(${campoFecha}) = ? AND YEAR(${campoFecha}) = ?`;
-    let queryParams = [mes, anio];
+    // Rango indexable (>= inicio de mes y < mes siguiente)
+    const fechaInicio = `${anioNum}-${String(mesNum).padStart(2, "0")}-01`;
+    const nextMes = mesNum === 12 ? 1 : mesNum + 1;
+    const nextAnio = mesNum === 12 ? anioNum + 1 : anioNum;
+    const fechaFin = `${nextAnio}-${String(nextMes).padStart(2, "0")}-01`;
 
-    if (idModalidad) {
-      whereClause += ` AND o.id_modalidad = ?`;
-      queryParams.push(idModalidad);
-    }
+    const cacheKey = `est_para_${modo}_${anioNum}_${mesNum}_${idModalidad || "all"}_${idOrigen || "all"}_${limitNum}_${pageNum}_${busqueda.toLowerCase()}`;
 
-    if (idOrigen) {
-      whereClause += ` AND o.id_origen = ?`;
-      queryParams.push(idOrigen);
-    }
+    const [modalidadesRows, origenesRows, datosEstadisticos] = await Promise.all([
+      obtenerConCache("cat_modalidades_est", async () => {
+        const [r] = await db.query("SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC");
+        return r;
+      }),
+      obtenerConCache("cat_origenes_est", async () => {
+        const [r] = await db.query("SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC");
+        return r;
+      }),
+      obtenerConCache(
+        cacheKey,
+        async () => {
+          let whereClause = `WHERE ${campoFecha} >= ? AND ${campoFecha} < ?`;
+          const queryParams = [fechaInicio, fechaFin];
 
-    // Filtro dinámico por nombre o apellidos del personal
-    let searchClause = "";
-    let searchParams = [];
-    if (busqueda.trim() !== "") {
-      searchClause = ` AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) LIKE ?)`;
-      const termino = `%${busqueda.trim()}%`;
-      searchParams = [termino, termino, termino, termino];
-    }
+          if (idModalidad && !Number.isNaN(idModalidad)) {
+            whereClause += " AND o.id_modalidad = ?";
+            queryParams.push(idModalidad);
+          }
 
-    // 1. Evolución diaria
-    const sqlDiarioTurnos = `
-      SELECT 
-        DAY(${campoFecha}) AS dia,
-        o.turnr AS turno,
-        COUNT(o.id_ocurrencia) AS total
-      FROM ocurrencia_registro o
-      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      LEFT JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause} AND o.turnr IN ('M', 'T', 'N')
-      GROUP BY DAY(${campoFecha}), o.turnr
-      ORDER BY dia ASC, FIELD(o.turnr, 'M', 'T', 'N');
-    `;
+          if (idOrigen && !Number.isNaN(idOrigen)) {
+            whereClause += " AND o.id_origen = ?";
+            queryParams.push(idOrigen);
+          }
 
-    // 2. Paginación de usuarios por rendimiento total (De mayor a menor)
-    const limitNum = parseInt(limit, 10) || 10;
-    const offsetNum = parseInt(offset, 10) || 0;
-    
-    const sqlPaginarUsuarios = `
-      SELECT us.id_usuario, COUNT(o.id_ocurrencia) AS total_ocurrencias
-      FROM ocurrencia_registro o
-      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause}
-      GROUP BY us.id_usuario
-      ORDER BY total_ocurrencias DESC, us.id_usuario ASC
-      LIMIT ? OFFSET ?;
-    `;
+          let searchClause = "";
+          let searchParams = [];
+          if (busqueda !== "") {
+            searchClause =
+              " AND (p.nombres LIKE ? OR p.apellido_paterno LIKE ? OR p.apellido_materno LIKE ? OR CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres) LIKE ?)";
+            const termino = `%${busqueda}%`;
+            searchParams = [termino, termino, termino, termino];
+          }
 
-    const [paginatedUsersRows] = await connection.query(
-      sqlPaginarUsuarios,
-      [...queryParams, ...searchParams, limitNum, offsetNum]
-    );
+          const allParams = [...queryParams, ...searchParams];
 
-    const userIds = paginatedUsersRows.map(row => row.id_usuario);
+          const sqlDiarioTurnos = `
+            SELECT 
+              DAY(${campoFecha}) AS dia,
+              o.turnr AS turno,
+              COUNT(o.id_ocurrencia) AS total
+            FROM ocurrencia_registro o
+            ${searchClause ? "LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario LEFT JOIN persona p ON us.id_persona = p.id_persona" : ""}
+            ${whereClause} ${searchClause} AND o.turnr IN ('M', 'T', 'N')
+            GROUP BY DAY(${campoFecha}), o.turnr
+            ORDER BY dia ASC, FIELD(o.turnr, 'M', 'T', 'N')
+          `;
 
-    // Contar el total de usuarios únicos con estos filtros y búsqueda
-    const sqlTotalUsuarios = `
-      SELECT COUNT(DISTINCT o.id_usuario) AS total_usuarios
-      FROM ocurrencia_registro o
-      JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      JOIN persona p ON us.id_persona = p.id_persona
-      ${whereClause} ${searchClause};
-    `;
-    const [totalUsersRows] = await connection.query(sqlTotalUsuarios, [...queryParams, ...searchParams]);
-    const totalUsuariosCount = totalUsersRows[0]?.total_usuarios || 0;
+          const sqlPaginarUsuarios = `
+            SELECT us.id_usuario, COUNT(o.id_ocurrencia) AS total_ocurrencias
+            FROM ocurrencia_registro o
+            JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+            JOIN persona p ON us.id_persona = p.id_persona
+            ${whereClause} ${searchClause}
+            GROUP BY us.id_usuario
+            ORDER BY total_ocurrencias DESC, us.id_usuario ASC
+            LIMIT ? OFFSET ?
+          `;
 
-    let matrizRows = [];
-    if (userIds.length > 0) {
-      const placeholders = userIds.map(() => '?').join(',');
-      const sqlMatrizUsuarios = `
-        SELECT 
-          COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
-          DAY(${campoFecha}) AS dia,
-          o.turnr AS turno,
-          o.id_modalidad,
-          COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
-          COALESCE(ori.descripcion, 'SIN ORIGEN') AS origen_descripcion,
-          COUNT(o.id_ocurrencia) AS total
-        FROM ocurrencia_registro o
-        LEFT JOIN origen ori ON o.id_origen = ori.id_origen
-        LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-        LEFT JOIN persona p ON us.id_persona = p.id_persona
-        LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
-        ${whereClause} ${searchClause} AND o.id_usuario IN (${placeholders})
-        GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(${campoFecha}), o.turnr, o.id_modalidad, m.nombre, ori.descripcion
-        ORDER BY usuario ASC;
-      `;
-      const [rows] = await connection.query(sqlMatrizUsuarios, [...queryParams, ...searchParams, ...userIds]);
-      matrizRows = rows;
-    }
+          const sqlTotalUsuarios = `
+            SELECT COUNT(DISTINCT o.id_usuario) AS total_usuarios
+            FROM ocurrencia_registro o
+            JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+            JOIN persona p ON us.id_persona = p.id_persona
+            ${whereClause} ${searchClause}
+          `;
 
-    // 3. Totales generales del mes
-  // 3. Totales generales del mes e indicadores de datos importantes
- // 3. Totales generales del mes e indicadores de Detalle Paramédico
-    const sqlTotalesMes = `
-      SELECT 
-        COUNT(o.id_ocurrencia) AS total_mes,
-        SUM(CASE WHEN o.turnr = 'M' THEN 1 ELSE 0 END) AS total_mañana,
-        SUM(CASE WHEN o.turnr = 'T' THEN 1 ELSE 0 END) AS total_tarde,
-        SUM(CASE WHEN o.turnr = 'N' THEN 1 ELSE 0 END) AS total_noche,
-        SUM(COALESCE(di.por_orden_central, 0)) AS sum_por_orden_central,
-        SUM(COALESCE(di.control_fv_sv, 0)) AS sum_control_fv_sv,
-        SUM(COALESCE(di.inyectable, 0)) AS sum_inyectable,
-        SUM(COALESCE(di.curacion_topica, 0)) AS sum_curacion_topica,
-        SUM(COALESCE(di.traslado_urgencia, 0)) AS sum_traslado_urgencia,
-        SUM(COALESCE(di.pertenece_muni, 0)) AS sum_pertenece_muni
-      FROM ocurrencia_registro o
-      LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
-      JOIN persona p ON us.id_persona = p.id_persona
-      LEFT JOIN detalle_datos_importantes_ocurrencia di ON o.id_ocurrencia = di.id_ocurrencia
-      ${whereClause} ${searchClause};
-    `;
+          const sqlTotalesMes = `
+            SELECT 
+              COUNT(o.id_ocurrencia) AS total_mes,
+              SUM(CASE WHEN o.turnr = 'M' THEN 1 ELSE 0 END) AS total_mañana,
+              SUM(CASE WHEN o.turnr = 'T' THEN 1 ELSE 0 END) AS total_tarde,
+              SUM(CASE WHEN o.turnr = 'N' THEN 1 ELSE 0 END) AS total_noche,
+              SUM(COALESCE(di.por_orden_central, 0)) AS sum_por_orden_central,
+              SUM(COALESCE(di.control_fv_sv, 0)) AS sum_control_fv_sv,
+              SUM(COALESCE(di.inyectable, 0)) AS sum_inyectable,
+              SUM(COALESCE(di.curacion_topica, 0)) AS sum_curacion_topica,
+              SUM(COALESCE(di.traslado_urgencia, 0)) AS sum_traslado_urgencia,
+              SUM(COALESCE(di.pertenece_muni, 0)) AS sum_pertenece_muni
+            FROM ocurrencia_registro o
+            ${searchClause ? "LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario JOIN persona p ON us.id_persona = p.id_persona" : ""}
+            LEFT JOIN detalle_datos_importantes_ocurrencia di ON o.id_ocurrencia = di.id_ocurrencia
+            ${whereClause} ${searchClause}
+          `;
 
-    // 4. Catálogos (Modalidades y Orígenes)
-    const [modalidadesRows] = await connection.query(`SELECT id, nombre FROM cat_modalidad ORDER BY nombre ASC`);
-    const [origenesRows] = await connection.query(`SELECT id_origen, descripcion FROM origen ORDER BY descripcion ASC`); // <--- Agregado
-    
-    const [diarioRows] = await connection.query(sqlDiarioTurnos, [...queryParams, ...searchParams]);
-    const [totalesRows] = await connection.query(sqlTotalesMes, [...queryParams, ...searchParams]);
+          const [[paginatedUsersRows], [totalUsersRows], [diarioRows], [totalesRows]] =
+            await Promise.all([
+              db.query(sqlPaginarUsuarios, [...allParams, limitNum, offsetNum]),
+              db.query(sqlTotalUsuarios, allParams),
+              db.query(sqlDiarioTurnos, allParams),
+              db.query(sqlTotalesMes, allParams),
+            ]);
 
-    res.json({
+          const userIds = paginatedUsersRows.map((row) => row.id_usuario);
+          let matrizRows = [];
+
+          if (userIds.length > 0) {
+            const placeholders = userIds.map(() => "?").join(",");
+            const sqlMatrizUsuarios = `
+              SELECT 
+                COALESCE(CONCAT(p.apellido_paterno, ' ', p.apellido_materno, ', ', p.nombres), 'Sin asignar') AS usuario,
+                DAY(${campoFecha}) AS dia,
+                o.turnr AS turno,
+                o.id_modalidad,
+                COALESCE(m.nombre, 'SIN MODALIDAD') AS nombre_modalidad,
+                COALESCE(ori.descripcion, 'SIN ORIGEN') AS origen_descripcion,
+                COUNT(o.id_ocurrencia) AS total
+              FROM ocurrencia_registro o
+              LEFT JOIN origen ori ON o.id_origen = ori.id_origen
+              LEFT JOIN usuarios_sistema us ON o.id_usuario = us.id_usuario
+              LEFT JOIN persona p ON us.id_persona = p.id_persona
+              LEFT JOIN cat_modalidad m ON o.id_modalidad = m.id
+              ${whereClause} AND o.id_usuario IN (${placeholders})
+              GROUP BY us.id_usuario, p.apellido_paterno, p.apellido_materno, p.nombres, DAY(${campoFecha}), o.turnr, o.id_modalidad, m.nombre, ori.descripcion
+              ORDER BY usuario ASC
+            `;
+            const [rows] = await db.query(sqlMatrizUsuarios, [...queryParams, ...userIds]);
+            matrizRows = rows;
+          }
+
+          return {
+            evolucion_diaria_turnos: diarioRows,
+            matriz_usuarios: matrizRows,
+            total_usuarios_count: totalUsersRows[0]?.total_usuarios || 0,
+            totales_mes: totalesRows[0] || {
+              total_mes: 0,
+              total_mañana: 0,
+              total_tarde: 0,
+              total_noche: 0,
+              sum_por_orden_central: 0,
+              sum_control_fv_sv: 0,
+              sum_inyectable: 0,
+              sum_curacion_topica: 0,
+              sum_traslado_urgencia: 0,
+              sum_pertenece_muni: 0,
+            },
+          };
+        },
+        60 * 1000
+      ),
+    ]);
+
+    return res.json({
       success: true,
       modo_usado: modo,
       campo_fecha_usado: campoFecha,
-      evolucion_diaria_turnos: diarioRows,
-      matriz_usuarios: matrizRows,
-      total_usuarios_count: totalUsuariosCount,
-      totales_mes: totalesRows[0] || { total_mes: 0, total_mañana: 0, total_tarde: 0, total_noche: 0 },
+      ...datosEstadisticos,
       modalidades_catalogo: modalidadesRows,
-      origenes_catalogo: origenesRows, // <--- Enviado al frontend
+      origenes_catalogo: origenesRows,
     });
   } catch (error) {
-    console.error("ERROR EN /ocurrencias/estadisticas-mensuales3:", error);
-    res.status(500).json({ success: false, error: error.message });
-  } finally {
-    if (connection) connection.release();
+    console.error("ERROR EN /ocurrencias/estadisticas-mensualespara:", error);
+    return res.status(500).json({ success: false, error: "Error interno al cargar estadísticas." });
   }
 });
 
